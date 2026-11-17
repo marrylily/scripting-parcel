@@ -8,12 +8,13 @@ import { companyName } from "../theme"
 import { isAwaitingPickup, isTransitPkg, sourceOf, stationHaystack, cardTitleOf } from "../utils/model"
 import { brandOf } from "../utils/appBrand"
 
-export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged }: {
+export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged, onRefresh }: {
   revision: number
   onAdd: () => void
   onEdit: (p: Pickup) => void
   onExit: () => void
   onChanged: () => void
+  onRefresh?: () => Promise<void>
 }) {
   void revision
   // 筛选记忆：跨启动保存在 Storage
@@ -97,6 +98,7 @@ export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged }: {
       <ScrollView navigationTitle="" navigationBarTitleDisplayMode="inline" scrollIndicator="never"
         toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}
         scrollDismissesKeyboard="interactively"
+        refreshable={onRefresh}
         onScrollPhaseChange={(_old, phase, context) => {
           // 只在顶部继续下拉、且松手后展开；普通纵向滚动和卡片横滑不拦截。
           if (phase !== "tracking" && phase !== "interacting") {

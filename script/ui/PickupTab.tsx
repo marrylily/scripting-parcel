@@ -38,7 +38,7 @@ function pairRows<T>(arr: T[]): T[][] {
   return rows
 }
 
-export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIdentity, onAll, onExit, onChanged, onSimpleModeChanged, onStationTap }: {
+export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIdentity, onAll, onExit, onChanged, onSimpleModeChanged, onStationTap, onRefresh }: {
   revision: number
   onAdd: () => void
   onEdit: (p: Pickup) => void
@@ -49,6 +49,7 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
   onChanged: () => void
   onSimpleModeChanged?: () => void
   onStationTap?: (name: string) => void
+  onRefresh?: () => Promise<void>
 }) {
   const [identityMenu, setIdentityMenu] = useState(false)
   const [statMode, setStatMode] = useState<"total" | "month">("total")
@@ -106,7 +107,8 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
   return (
     <Screen margin={20} exitAction={onExit} actions={<FloatingActions items={actions} />}>
       <ScrollView navigationTitle="" navigationBarTitleDisplayMode="inline" scrollIndicator="never"
-        toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}>
+        toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}
+        refreshable={onRefresh}>
         <VStack alignment="leading" spacing={0} frame={{ maxWidth: "infinity", alignment: "leading" }}
           padding={{ top: 4, bottom: simpleMode ? 12 : 170 }}>
 

@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.4 remote-update edition. Wraps Scripting timers so WebView/background callbacks do not surface “Timer requires its active script on the main”; stamps sync failures with version and time; clears stale App Group failure records at sync start. Auth and keys unchanged.",
+  "description": "ParcelPal 1.2.5 remote-update edition. Foreground/open/pull-to-refresh run Taobao discovery like other platforms; last-sync updates even with 0 new orders; skips are stamped with version. Auth and keys unchanged.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.4 远程更新版：安全包装会触发「Timer requires its active script on the main」的计时器；同步开始时清除旧失败记录，新失败带版本号和时间。登录与密钥逻辑未改。",
-    "en": "1.2.4 remote-update edition. Safely wraps Scripting timers that can throw “Timer requires its active script on the main”; clears stale failure records at sync start and stamps new failures with version and time. Auth and keys unchanged."
+    "zh": "1.2.5 远程更新版：打开 App、下拉刷新、全量同步时淘宝与其他平台一样参与；成功（含 0 个新订单）更新上次同步；被跳过时显示带版本号的原因。登录与密钥逻辑未改。",
+    "en": "1.2.5 remote-update edition. Opening the app, pull-to-refresh, and full sync include Taobao like other platforms; last-sync updates even with 0 new orders; skipped runs show a version-stamped reason. Auth and keys unchanged."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",
