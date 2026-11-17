@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.8 remote-update edition. An H5 order-page timeout no longer skips the PC order page. Login and challenge pages still stop the round. Empty documents are not treated as success. Does not guarantee proxy connectivity.",
+  "description": "ParcelPal 1.2.9 remote-update edition. Resolves H5 order-page loading as soon as committed Ultron order data is ready instead of waiting 20s for stalled subresources. Login and challenge pages still stop the round. Empty documents are not treated as success.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.8 远程更新版：淘宝 H5 订单页超时后，预算还够就会继续已有的 PC 订单页。登录和验证页仍会停止。空页面不会当成同步成功。不保证代理网络一定能连上。",
-    "en": "1.2.8 remote-update edition. After the Taobao H5 order page times out, the existing PC order page still runs when budget remains. Login and challenge pages still stop the round. An empty document is not a successful sync. This does not guarantee proxy connectivity."
+    "zh": "1.2.9 远程更新版：淘宝 H5 订单页在 commit 后一旦检测到 Ultron 订单数据就绪立即完成加载，不再被广告/统计子资源阻塞满 20 秒并报「失败 加载H5订单页 20.0秒」。",
+    "en": "1.2.9 remote-update edition. Completes Taobao H5 order-page loading as soon as committed Ultron order data is ready instead of waiting 20s for stalled subresources."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",

@@ -1,7 +1,7 @@
-import { COOKIE_KEY, Pkg, Snapshot, classify, closedOrderStatus, timeOfTrack, isHistoricalPkg, statusFromCode } from "./model"
+import { COOKIE_KEY, type Pkg, type Snapshot, classify, closedOrderStatus, timeOfTrack, isHistoricalPkg, statusFromCode } from "./model"
 import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded, formatBudgetExhausted, remainingMs } from "./syncSafety"
 import { safeTimeoutRace, tryScheduleTimeout, safeClearTimeout, isTimerUnavailable } from "./safeTimer"
-import { beginTaobaoDiag, recordTaobaoStep, finishTaobaoDiag, abandonTaobaoDiag } from "./taobaoTrace"
+import { beginTaobaoDiag, recordTaobaoStep, resolveTaobaoStep, finishTaobaoDiag, abandonTaobaoDiag } from "./taobaoTrace"
 import { canBoundPageLoad, evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
 import { attachNavWatch, formatObservedTimeout, redactLocation } from "./navWatch"
 import { SyncSuperseded, bindRunCleanup, isSupersededError, runIsCurrent } from "./syncGate"
@@ -621,10 +621,24 @@ function hitFromError(e: any): StageHit {
   return { type: "miss", detail }
 }
 
+const H5_COMMIT_READY_JS = `return (function(){
+  try {
+    var s = window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''
+    if (/bizOrderId=\\d{10,}|"orderId":"\\d{10,}"/.test(s)) return 1
+    var h = document.documentElement ? document.documentElement.outerHTML : ''
+    if (/bizOrderId[=:"%]+\\d{10,}/.test(h)) return 1
+    var t = document.body ? document.body.innerText.slice(0, 500) : ''
+    if (/滑动验证|请完成验证|安全验证|人机验证|滑块验证|验证码|captcha/i.test(t)) return 1
+    return 0
+  } catch (e) { return 0 }
+})()`
+
 /**
  * 只等一次官方加载。
  * loadRequest 的 timeoutInterval（秒）或 waitForLoad({ timeout, cancelOnTimeout }) 负责上限。
  * 加载成功后不再调用 waitForLoad，避免单页应用第二次加载事件一直不来。
+ * 当 stopOnTimeout 为 false（H5 订单页）且 commit 事件已触发时，若 Ultron 订单数据已写入页面，
+ * 直接提前结束等待，避免被广告/统计子资源阻塞满 20 秒并留下「失败 加载H5订单页 20.0秒」。
  */
 async function loadAndWait(controller: WebViewController, url: string, ms: number, step: string, ctx: TaobaoRun, retries = 0, stopOnTimeout = true): Promise<void> {
   let last: Error | null = null
@@ -634,14 +648,46 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
     const label = i ? `${step}（重试）` : step
     let recorded = false
     let watch: Awaited<ReturnType<typeof attachNavWatch>> | null = null
+    let probeActive = !stopOnTimeout
+    let resolveEarly: ((v: boolean) => void) | null = null
+    const earlyReady = !stopOnTimeout ? new Promise<boolean>((resolve) => { resolveEarly = resolve }) : undefined
+    const startCommitProbe = () => {
+      if (!probeActive || !resolveEarly) return
+      probeActive = false
+      let active = true
+      const origStop = () => { active = false }
+      ;(earlyReady as any).__stop = origStop
+      void (async () => {
+        for (let k = 0; k < 12 && active; k++) {
+          if (k > 0) {
+            const armed = tryScheduleTimeout(() => {}, 10)
+            if (!armed.scheduled) return
+            safeClearTimeout(armed.id)
+            await new Promise<void>((r) => {
+              const t = tryScheduleTimeout(() => r(), 350)
+              if (!t.scheduled) r()
+            })
+          }
+          if (!active || (ctx.syncId != null && !runIsCurrent(ctx.syncId))) return
+          try {
+            const rv: any = await evaluateBounded(controller as any, H5_COMMIT_READY_JS, 1_500, "检查H5就绪", tryScheduleTimeout, safeClearTimeout)
+            if (active && (rv === 1 || rv === true || String(rv) === "1")) {
+              active = false
+              resolveEarly?.(true)
+              return
+            }
+          } catch { /* 页面尚未就绪时继续下一轮探测 */ }
+        }
+      })()
+    }
     try {
       if (deadlineReached(ctx.deadline)) throw budgetError(ctx, url)
       const cap = waitCap(ctx.deadline, ms)
       if (cap < 1000) throw budgetError(ctx, url)
-      watch = await attachNavWatch(controller as any, t0)
+      watch = await attachNavWatch(controller as any, t0, !stopOnTimeout ? startCommitProbe : undefined)
       try {
         try {
-          await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout, stopOnTimeout)
+          await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout, stopOnTimeout, earlyReady)
         } catch (e) {
           if (watch?.authDetail) throw new Error(watch.authDetail)
           if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
@@ -651,6 +697,8 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
         }
         if (watch?.authDetail) throw new Error(watch.authDetail)
       } finally {
+        probeActive = false
+        try { (earlyReady as any)?.__stop?.() } catch { }
         for (const ev of watch?.events ?? []) {
           recordTaobaoStep(`导航·${ev.type}`, ev.atMs, ev.kind === "other" || ev.kind === "empty", undefined, `${ev.location || "无"} id=${ev.navigationId}`, ctx.diagId)
         }
@@ -695,6 +743,13 @@ const H5_SALVAGE_JS = `return (function(){
     while ((m = re1.exec(blob))) push(m[1])
     var re2 = /"orderId":"(\\d{10,})"/g
     while ((m = re2.exec(blob))) push(m[1])
+    if (ids.length === 0) {
+      var html = document.documentElement ? document.documentElement.outerHTML : ''
+      var re3 = /bizOrderId[=:"%]+(\\d{10,})/g
+      while ((m = re3.exec(html))) push(m[1])
+      var re4 = /"orderId":"(\\d{10,})"/g
+      while ((m = re4.exec(html))) push(m[1])
+    }
     var text = ''
     try { text = document.body ? document.body.innerText.slice(0, 500) : '' } catch (e1) {}
     var href = String(location.href || '').split('?')[0].split('#')[0]
@@ -737,6 +792,7 @@ async function salvageH5(controller: WebViewController, ctx: TaobaoRun): Promise
       emptyConfirmed: !!info.emp,
     })
     if (cls === "orders") {
+      resolveTaobaoStep("加载H5订单页", href || "https://h5.m.taobao.com/mlapp/olist.html", undefined, ctx.diagId)
       recordTaobaoStep("超时后读取H5", Date.now() - t0, true, href, `${ids.length} 单`, ctx.diagId)
       return { type: "orders", ids, detail: `超时后读取到 ${ids.length} 单` }
     }
@@ -803,6 +859,15 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
         const pushH5 = (v: string) => { if (v && !h5Ids.includes(v)) h5Ids.push(v) }
         for (const m of blob.matchAll(/bizOrderId=(\d{10,})/g)) pushH5(m[1])
         for (const m of blob.matchAll(/"orderId":"(\d{10,})"/g)) pushH5(m[1])
+        if (h5Ids.length === 0) {
+          try {
+            const raw = String(await evalPage<string>(controller, IDS_ONLY, 4_000, "读取H5订单号", ctx) || "")
+            const info: any = JSON.parse(raw || "{}")
+            for (const v of String(info.ids || "").split(",")) if (v) pushH5(v)
+          } catch (e) {
+            if (isSupersededError(e) || isPageCapability(e)) throw e
+          }
+        }
         diag("taobao-h5", { len: blob.length, n: h5Ids.length })
         if (h5Ids.length > 0) {
           markPage(ctx, true)

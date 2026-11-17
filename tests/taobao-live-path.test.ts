@@ -46,7 +46,7 @@ function assertNoSecrets(text: string) {
   assert.equal(text.includes(ORDER_DIGITS), false)
 }
 
-type Mode = "timeout-pc" | "login" | "app" | "timer-fail" | "late" | "budget"
+type Mode = "timeout-pc" | "login" | "app" | "timer-fail" | "late" | "budget" | "commit-ready"
 
 function installPage(mode: Mode) {
   const loads: string[] = []
@@ -84,6 +84,10 @@ function installPage(mode: Mode) {
         emit("redirect", `tbopen://m.taobao.com/open?cookie=${SECRET_QUERY}`, "nav-app")
         return false
       }
+      if (mode === "commit-ready" && req.url.includes("olist")) {
+        emit("commit", `https://h5.m.taobao.com/mlapp/olist.html?cookie=${SECRET_QUERY}`, "nav-commit")
+        return new Promise<boolean>(() => {})
+      }
       if (mode === "timeout-pc" && req.url.includes("olist") && loads.filter(u => u.includes("olist")).length === 1) {
         emit("redirect", `https://www.taobao.com/markets/sale?cookie=${SECRET_QUERY}`, "nav-other")
         return new Promise<boolean>(() => {})
@@ -96,6 +100,13 @@ function installPage(mode: Mode) {
       return true
     }
     async evaluateJavaScript(js: string) {
+      if (mode === "commit-ready") {
+        if (js.includes("currentUltronData") && js.includes("return 1")) return 1
+        if (js.includes("return window.currentUltronData")) return JSON.stringify({ orderId: ORDER_DIGITS })
+        if (js.includes("return location.href")) return "https://h5.m.taobao.com/mlapp/olist.html"
+        if (js.includes("return location.host")) return "h5.m.taobao.com"
+        return ""
+      }
       if (js.includes("htmlLen")) {
         return JSON.stringify({
           href: "https://h5.m.taobao.com/mlapp/olist.html",
@@ -210,4 +221,18 @@ test("budget exhaustion after H5 does not start PC", async () => {
   assert.equal(page.loads.some(url => url.includes("buyertrade")), false)
   assert.match(String((out.error as Error)?.message ?? ""), /预算用尽/)
   assertNoSecrets(JSON.stringify(out.diag))
+})
+
+test("H5 commit with Ultron orders ready completes immediately without 20s load timeout", async () => {
+  fastTimers()
+  const page = installPage("commit-ready")
+  const out = await runDiscover(180_000)
+  assert.deepEqual(out.result, [ORDER_DIGITS])
+  assert.equal(page.loads.some(url => url.includes("buyertrade.taobao.com")), false)
+  const h5Step = out.diag?.steps.find(s => s.name === "加载H5订单页")
+  assert.ok(h5Step)
+  assert.equal(h5Step?.ok, true)
+  assert.equal(out.diag?.steps.some(s => s.name === "超时后读取H5"), false)
+  assertNoSecrets(JSON.stringify(out.diag))
+  assert.equal(page.added(), page.removed.length)
 })

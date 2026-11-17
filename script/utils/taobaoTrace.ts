@@ -39,6 +39,24 @@ export function recordTaobaoStep(name: string, ms: number, ok: boolean, url?: st
   cur.steps.push(step)
 }
 
+/** 当 H5 订单页因静态子资源/埋点未结束触发超时，但已提交文档成功读出真实订单时，将对应加载步骤修正为完成。 */
+export function resolveTaobaoStep(name: string, url?: string, note?: string, runId?: number): void {
+  if (!cur || cur.finished) return
+  if (runId == null || runId !== cur.id) return
+  for (let i = cur.steps.length - 1; i >= 0; i--) {
+    if (cur.steps[i].name === name) {
+      cur.steps[i].ok = true
+      const loc = url ? pageUrlOf(url) : ""
+      if (loc) cur.steps[i].url = loc
+      if (note !== undefined) {
+        if (note) cur.steps[i].note = sanitizeSyncMessage(String(note), 80)
+        else delete cur.steps[i].note
+      }
+      return
+    }
+  }
+}
+
 export function abandonTaobaoDiag(runId: number): void {
   if (!cur || cur.id !== runId) return
   cur.finished = true

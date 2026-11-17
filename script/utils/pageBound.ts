@@ -56,6 +56,8 @@ type SettleOpts = {
   /** start() 自己带官方超时（loadRequest / waitForLoad timeout）时为 true。 */
   nativeBound: boolean
   onTimeout?: () => void
+  /** commit 后若页面核心数据已就绪，允许提前以成功结束等待，不必死等埋点/子资源 loadFinish。 */
+  earlyValue?: Promise<any>
 }
 
 function silence(p: unknown): void {
@@ -97,14 +99,19 @@ export async function settleWithin<T>(start: () => Promise<T>, ms: number, opts:
 
   const op = Promise.resolve().then(start)
   void op.then(() => {}, () => {})
+  const candidates: Promise<T>[] = [op]
+  if (opts.earlyValue) {
+    silence(opts.earlyValue)
+    candidates.push(opts.earlyValue as Promise<T>)
+  }
 
   if (!scheduled) {
-    const value = await op
+    const value = await Promise.race(candidates)
     return { ok: true, value }
   }
 
   try {
-    const value = await Promise.race([op, timerPromise])
+    const value = await Promise.race([...candidates, timerPromise])
     try { opts.clear(timerId) } catch { /* 取消计时失败不影响结果 */ }
     if (timedOut) return { ok: false, reason: "timeout" }
     return { ok: true, value }
@@ -138,6 +145,7 @@ export async function loadPageBounded(
   schedule: TimerSchedule,
   clear: TimerClear,
   stopOnTimeout = true,
+  earlyReady?: Promise<boolean>,
 ): Promise<void> {
   const seconds = Math.max(0.05, ms / 1000)
   const fail = (reason: "timeout" | "capability") => {
@@ -150,7 +158,7 @@ export async function loadPageBounded(
     const result = await settleWithin(
       () => page.loadRequest!({ url, timeoutInterval: seconds }),
       ms,
-      { schedule, clear, nativeBound: true, onTimeout },
+      { schedule, clear, nativeBound: true, onTimeout, earlyValue: earlyReady },
     )
     if (!result.ok) fail(result.reason)
     if (result.value !== true) throw new PageTimeoutError(step)
@@ -164,7 +172,7 @@ export async function loadPageBounded(
         return page.waitForLoad!({ timeout: seconds, cancelOnTimeout: stopOnTimeout })
       },
       ms,
-      { schedule, clear, nativeBound: true, onTimeout },
+      { schedule, clear, nativeBound: true, onTimeout, earlyValue: earlyReady },
     )
     if (!result.ok) fail(result.reason)
     if (result.value !== true) throw new PageTimeoutError(step)
@@ -179,6 +187,7 @@ export async function loadPageBounded(
       schedule,
       clear,
       nativeBound: false,
+      earlyValue: earlyReady,
       onTimeout() {
         stopQuiet(page)
         try { page.dispose?.() } catch { /* dispose 是官方用来结束未完成加载的办法 */ }

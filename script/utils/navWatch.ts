@@ -89,7 +89,7 @@ export type NavWatch = {
   stop: () => Promise<void>
 }
 
-export async function attachNavWatch(page: NavPage, startedAt = Date.now()): Promise<NavWatch> {
+export async function attachNavWatch(page: NavPage, startedAt = Date.now(), onCommit?: () => void): Promise<NavWatch> {
   const events: NavObservation[] = []
   const watch: NavWatch = {
     events,
@@ -117,6 +117,8 @@ export async function attachNavWatch(page: NavPage, startedAt = Date.now()): Pro
       if ((kind === "auth" || kind === "app-launch") && !watch.authDetail) {
         watch.authDetail = authStopMessage(kind, location)
         try { void page.stopLoading?.() } catch { /* 停导航失败也要结束本轮 */ }
+      } else if (type === "commit" && kind === "other" && !watch.authDetail) {
+        try { onCommit?.() } catch { /* commit 回调异常不影响导航监听 */ }
       }
     } catch { /* 单个监听异常不向外抛 */ }
   }
