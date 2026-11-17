@@ -196,8 +196,14 @@ export function parseLogistics(html: string): {
     // 取件码：淘宝这页目前不返回（只有 facilityCode=柜机编号），有就取，没有交给关键词兜底
     pickupCode: firstMatch(html, /"(?:pickupCode|takeCode|pickup_code|take_code)":"([A-Za-z0-9-]{3,20})"/),
     station,
-    // 官方说签收就直接用官方文案，不管节点停在哪儿（驿站不回传新节点就会卡在「到达代收点」）
-    latest: statusFromCode(statusCode) === "delivered" ? (statusDesc || "已签收") : first,
+    // 官方说签收时：若最新节点已明确写出「已取出/已取件/凭取件码签收」则保留节点原话；
+    // 若驿站不回传新节点（仍停在「到达代收点/请凭取件码」），而官方 statusCode 已变为 SIGN，则标记为「已取件（已签收）」以自动转已取
+    latest: (() => {
+      if (statusFromCode(statusCode) !== "delivered") return first
+      if (first && /已领取|已取出|已取件|用户已取|已出库|出库成功|取件完成|已拿走|凭取件码签收|凭码签收|提货码签收|客户已签收|本人签收|已由本人|拍照签收/.test(first)) return first
+      if (statusDesc && /已取|取出|领取/.test(statusDesc)) return statusDesc
+      return "已取件（已签收）"
+    })(),
   }
 }
 

@@ -14,7 +14,7 @@ import { addPickup, arrivalState, getPickups, getSettings, matchStation, updateP
 import { extractPickupCode } from "./pickupCode"
 import { mergeCodes, codeKey } from "./codes"
 import { etaInObject, etaInText, etaTimeInText } from "./eta"
-import { notifyArrived } from "./reminders"
+import { notifyArrived, forgetArrived, reschedulePickupReminders } from "./reminders"
 import { arrivedAtOf } from "./arrive"
 import { companyCode, companyName } from "../theme"
 import { markPlatform, platformEnabled, type PlatformId } from "../platforms"
@@ -179,9 +179,12 @@ function upsert(s: Source, p: Pkg): boolean {
       // 平台还在正常跟踪：清掉之前的已退款/已取消标记（退款撤回/换货重发的场合）
       closed: "",
     }
-    // 刚变成已取：把平台节点里的取件时间记下来（卡片显示「取件 X月X日」）
-    if (patch.status === 2 && exist.status !== 2 && !exist.pickedAt) {
-      patch.pickedAt = arrivedAtOf(nodes) ?? Date.now()
+    // 刚变成已取：把平台节点里的取件时间记下来（卡片显示「取件 X月X日」），并清掉在柜信息与待投递提醒
+    if (patch.status === 2 && exist.status !== 2) {
+      if (!exist.pickedAt) patch.pickedAt = arrivedAtOf(nodes) ?? Date.now()
+      patch.fcBox = undefined
+      try { forgetArrived(exist) } catch { }
+      void reschedulePickupReminders(true).catch(() => { })
     }
     if (eta) patch.eta = eta
     if (etaAt) patch.etaAt = etaAt
@@ -200,10 +203,10 @@ function upsert(s: Source, p: Pkg): boolean {
     }
     if (station) { patch.courierStationName = station.name; patch.courierStationUuid = station.uuid }
     // 丰巢在柜信息（一键开柜要的柜机/格口/单件）：有就覆盖，取走后由下次同步自然失效
-    if (p.fcBox) patch.fcBox = p.fcBox
+    if (p.fcBox && patch.status !== 2) patch.fcBox = p.fcBox
     if (arrival === "arrived" && !exist.arrivedAt) patch.arrivedAt = arrivedAtOf(nodes) ?? Date.now()
     // 到站就提醒；重复不提醒靠 notifyArrived 自己的已通知表
-    if (arrival === "arrived") {
+    if (arrival === "arrived" && patch.status === 1) {
       void notifyArrived({ ...exist, ...patch, courierStationName: station?.name ?? exist.courierStationName ?? "" })
     }
     // 取件码合并：别的平台给的码不丢，两个都留（卡片上一起显示）
@@ -217,11 +220,12 @@ function upsert(s: Source, p: Pkg): boolean {
       patch.codes = merged
       if (!exist.code || codeKey(exist.code) !== codeKey(merged[0])) patch.code = merged[0]
     }
-    // 没新文案、也没驿站/码变化就不写，省一次存储；
-    // 但收货人信息是新的时也必须写（首次全量后详情页才能显示姓名/地址）
+    // 没新文案、也没驿站/码/状态变化就不写，省一次存储；
+    // 但收货人信息或待取->已取状态变化时必须写
+    const statusChanged = patch.status !== undefined && patch.status !== exist.status
     const recvChanged = (!!((patch as any).receiverName) && (patch as any).receiverName !== exist.receiverName)
       || (!!((patch as any).receiverAddress) && (patch as any).receiverAddress !== exist.receiverAddress)
-    if (!changed && !station && !patch.codes && !recvChanged && !p.fcBox) return false
+    if (!changed && !statusChanged && !station && !patch.codes && !recvChanged && !p.fcBox) return false
     updatePickup(exist.uuid, patch)
     return true
   }
@@ -603,12 +607,26 @@ async function refreshOne(item: any): Promise<boolean> {
     } as Pkg)
   }
   if (s === "fengchao") {
-    // 丰巢没有単件接口：拉一次在柜列表再按运单号对。取走后就不在列表里，
-    // 那就什么都不做（不能当成“已取”，它在柜状态本身不说明已取）
+    // 丰巢没有单件接口：拉一次在柜列表再按运单号对。
+    // 若原先带有 fcBox（确认曾入柜）且现在不在待取列表里，说明已从丰巢柜取出，自动置为已取。
     const list = await timeoutWrap(fcWaitPick(), 20000, "丰巢在柜件")
     const k = codeKey(String(item.mailNo || ""))
     const hit = k ? list.find(x => codeKey(x.expressId || "") === k) : undefined
-    if (!hit) return false
+    if (!hit) {
+      if (item.status === 1 && (item.fcBox || item.source === "fengchao")) {
+        return upsert("fengchao", {
+          orderId: item.orderId ?? `fc:${item.mailNo || item.code}`,
+          itemTitle: item.itemTitle || "丰巢快递柜",
+          shopName: "",
+          company: item.trackCompany || "",
+          mailNo: item.mailNo || "",
+          latest: "快件已从丰巢快递柜取出",
+          status: "delivered",
+          updatedAt: Date.now(),
+        } as Pkg)
+      }
+      return false
+    }
     const where = [hit.cabinetCode, hit.location].filter(Boolean).join(" ")
     const latest = [
       `快件已投递到丰巢快递柜${where ? `（${where}）` : ""}`,
@@ -690,6 +708,44 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
     const ok = await refreshOne(pageList[i]).catch(() => false)
     if (ok) changed++
     if (i < pageList.length - 1) await delay(PAGE_REFRESH_GAP)
+  }
+
+  // 顺带用菜鸟 MTOP 批量核销一次已取件：驿站扫码出库后，菜鸟状态立即变为 SIGN（c.done=true），
+  // 即使原包裹归属在淘宝/拼多多/京东，下拉刷新或小组件刷新也能立刻把「待取」自动转成「已取」。
+  if (taobaoHasLogin() && platformEnabled("cainiao")) {
+    try {
+      const pending = getPickups().filter(p => p.status === 1 && !p.pickedByUser && p.mailNo)
+      if (pending.length > 0) {
+        const cnList = await timeoutWrap(cnFetchMyPackages({ recentDays: 15, maxPages: 2 }), 12000, "菜鸟状态")
+        if (Array.isArray(cnList)) {
+          for (const c of cnList) {
+            if (!c.mailNo) continue
+            const st = String(c.status || "").toUpperCase()
+            if (!/SIGN/.test(st) && !c.done && !c.pickupCode) continue
+            const latest = /SIGN/.test(st) ? "已取件（菜鸟已签收）"
+              : /CANCEL|REJECT/.test(st) ? "已取消"
+                : /RETURN/.test(st) ? "已退货"
+                  : /LOST/.test(st) ? "快递丢失"
+                    : c.pickupCode ? "快件已到站，可取件"
+                      : "运输中"
+            const ok = upsert("cainiao", {
+              orderId: `cn:${c.mailNo}`,
+              itemTitle: c.title,
+              shopName: "",
+              company: c.company,
+              mailNo: c.mailNo,
+              latest,
+              status: /CANCEL|REJECT|RETURN|LOST/.test(st) ? "cancelled" : c.done ? "delivered" : "transit",
+              updatedAt: c.updatedAt ?? Date.now(),
+              stationName: c.station || undefined,
+              pickupCode: c.pickupCode || undefined,
+              eta: c.eta || undefined,
+            })
+            if (ok) changed++
+          }
+        }
+      }
+    } catch { }
   }
 
   return changed
@@ -812,6 +868,7 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
       } else if (id === "fengchao") {
         onProgress?.("正在读取丰巢快递柜…")
         const list = await fcWaitPick()
+        const inBoxKeys = new Set(list.map(p => codeKey(p.expressId || "")).filter(Boolean))
         for (const p of list) {
           // 文案要能被 arrivalState 判为「到站可取」（含「已投递」「快递柜」），
           // 同时把取件码写进文案，界面不依赖字段也能看到
@@ -838,6 +895,24 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
           // 只把取件码与柜机信息合进去，不新增卡片
           if (upsert("fengchao", pkg)) report.updated++
         }
+        // 原先带有 fcBox 在柜标记的待取件，若本次在柜列表已不存在，自动核销为已取件
+        for (const loc of getPickups()) {
+          if (loc.status === 1 && !loc.pickedByUser && loc.fcBox && loc.mailNo) {
+            const k = codeKey(loc.mailNo)
+            if (k && !inBoxKeys.has(k)) {
+              if (upsert("fengchao", {
+                orderId: loc.orderId ?? `fc:${loc.mailNo}`,
+                itemTitle: loc.itemTitle || "丰巢快递柜",
+                shopName: "",
+                company: loc.trackCompany || "",
+                mailNo: loc.mailNo,
+                latest: "快件已从丰巢快递柜取出",
+                status: "delivered",
+                updatedAt: Date.now(),
+              })) report.updated++
+            }
+          }
+        }
         markPlatform("fengchao", true)
       } else if (id === "cainiao") {
         onProgress?.("正在读取菜鸟包裹…")
@@ -847,8 +922,9 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
         for (const c of cnList) {
           if (!c.mailNo) continue
           // 菜鸟返回的是英文状态码（SIGN/CANCEL/TRANSPORT…），不能直接星到卡片上
+          // 菜鸟 SIGN 代表已从驿站/快递柜出库签收，标记为「已取件（菜鸟已签收）」以自动将待取包裹转为已取
           const st = String(c.status || "").toUpperCase()
-          const latest = /SIGN/.test(st) ? "已签收"
+          const latest = /SIGN/.test(st) ? "已取件（菜鸟已签收）"
             : /CANCEL|REJECT/.test(st) ? "已取消"
               : /RETURN/.test(st) ? "已退货"
                 : /LOST/.test(st) ? "快递丢失"

@@ -150,7 +150,7 @@ export async function fetchMyPackages(opts?: { recentDays?: number; maxPages?: n
         company: s(p, "cpName", "cp_name", "companyName") || s(p, "cpCode", "cp_code"),
         pickupCode: pickupCodeOf(p),
         station: s(st, "pointName", "point_name", "stationName", "name"),
-        atStation: !!pickupCodeOf(p) || !DONE_STATUS.has(status.toUpperCase()),
+        atStation: !DONE_STATUS.has(status.toUpperCase()) && !!pickupCodeOf(p),
         done: DONE_STATUS.has(status.toUpperCase()),
         status,
         updatedAt,

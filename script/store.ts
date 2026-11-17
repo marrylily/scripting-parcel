@@ -606,7 +606,8 @@ export function matchStation(text: string): { name: string; uuid: string } | nul
  *  - arrived：到站可取（含「已签收」，驿站件常是投递到柜/站后签收），进取件页
  *  - transit：还在路上，不进
  */
-const PICKED_TXT = /已领取|已取出|已取件|用户已取/
+const PICKED_TXT = /已领取|已取出|已取件|用户已取|已出库|出库成功|取件完成|已拿走|凭取件码签收|凭码签收|提货码签收|客户已签收|本人签收|已由本人|拍照签收|已从.{0,12}(?:驿站|代收|柜|自提点).{0,6}取出/
+const STILL_WAITING_TXT = /待取件|请及时取|请及时领取|请凭.{0,8}取|待领取|暂存|已存放|已放入/
 const ARRIVED_TXT = /待取件|已到站|已到达|已投递|已暂存|已存放|已放入|已代收|请及时取|请及时领取|凭取件码|待领取|已签收|已妥收|快递柜|驿站|代收点/
 
 export type ArrivalState = "picked" | "arrived" | "transit"
@@ -614,7 +615,7 @@ export type ArrivalState = "picked" | "arrived" | "transit"
 export function arrivalState(latest: string): ArrivalState {
   const t = (latest || "").trim()
   if (!t) return "transit"
-  if (PICKED_TXT.test(t)) return "picked"
+  if (PICKED_TXT.test(t) && !STILL_WAITING_TXT.test(t)) return "picked"
   if (ARRIVED_TXT.test(t)) return "arrived"
   return "transit"
 }
