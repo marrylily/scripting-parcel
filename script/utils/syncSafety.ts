@@ -77,3 +77,17 @@ export function summarizeReport(results: Record<string, SyncOutcome> | undefined
   for (const s of skipped) parts.push(`${s.name || "平台"}：${sanitizeSyncMessage(s.message || "已跳过", 16)}`)
   return sanitizeSyncMessage(parts.join("；"), 80)
 }
+
+/** 距上次成功是否已超过间隔。gapMs<=0 视为到期。 */
+export function platformDue(lastAt: number | undefined, gapMs: number, now = Date.now()): boolean {
+  if (!Number.isFinite(gapMs) || gapMs <= 0) return true
+  return now - (Number(lastAt) || 0) >= gapMs
+}
+
+/** 把间隔格式成「N 分钟」或「N 小时」，给跳过原因用。 */
+export function gapLabel(gapMs: number): string {
+  const m = Math.max(1, Math.round((Number(gapMs) || 0) / 60_000))
+  if (m >= 60 && m % 60 === 0) return `${m / 60} 小时`
+  if (m >= 60) return `${(m / 60).toFixed(1).replace(/\.0$/, "")} 小时`
+  return `${m} 分钟`
+}

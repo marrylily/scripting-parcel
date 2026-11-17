@@ -12,7 +12,7 @@ import { getSettings, writeWidgetSnapshot } from "../store"
 import { syncPickupActivity } from "../ui/live"
 import { markWidgetSynced } from "../widgetData"
 import { reschedulePickupReminders, dedupeDeliveredReminders } from "./reminders"
-import { maybeFullSync } from "./platformSync"
+import { maybeFullSync, foregroundFullGapMs } from "./platformSync"
 
 export type RefreshReason = "app"
 
@@ -57,23 +57,26 @@ export async function refreshAll(reason: RefreshReason = "app"): Promise<Refresh
   // 先在外面判断一次，才知道这次到底有没有真的联网（下面要报给 UI）
   const last = readSharedLast()
   const gap = appGapMs()
-  const canFetch = Date.now() - last >= gap
-  if (canFetch) {
+  const canLight = Date.now() - last >= gap
+  if (canLight) {
     markSharedLast()
     try {
       changed = await refreshTrackedPackages({
-        // 平台包裹也刷：淘宝走 HTTP；京东/拼多多要 WebView，扩展里没有就自动跳过
+        // 平台包裹也刷：淘宝已有订单走 HTTP；京东/拼多多要 WebView，扩展里没有就自动跳过
         platforms: true,
         minGapMs: gap,
         // 外层已判过冷却并先写共享时间；内层必须执行，不能再被刚写的时间挡回。
         force: true,
       })
-      // 每 fullSyncHours 一次全量发现新订单（App 与小组件共用时间戳）。
-      // 预算 60 秒：这是前台，用户在看，可以等；组件那边是 18 秒。
-      changed += await maybeFullSync(60_000)
       fetched = true
     } catch { }
   }
+  // 全量发现与轻量刷新分开：小组件刚刷过已有物流时，不能再挡住淘宝在前台发现新单。
+  try {
+    const full = await maybeFullSync(60_000, { gapMs: foregroundFullGapMs() })
+    changed += full.added
+    if (full.attempted || full.ok.length) fetched = true
+  } catch { }
 
   // 系统通知（超时/到站）由 iOS 日历触发器投递；每次刷新先清掉历史并发留下的重复项
   try { void dedupeDeliveredReminders() } catch { }
@@ -89,4 +92,25 @@ export async function refreshAll(reason: RefreshReason = "app"): Promise<Refresh
   }
   // 不在这里 reload 小组件：数据写入时 store 已经带 600ms 合并刷过了
   return { changed, fetched }
+}
+
+/** 用户下拉刷新：立刻做轻量刷新，并按很短的间隔让到期平台（含淘宝）参与全量发现。 */
+export async function refreshNow(): Promise<RefreshResult> {
+  let changed = 0
+  markSharedLast()
+  try {
+    changed = await refreshTrackedPackages({ platforms: true, force: true, minGapMs: 0 })
+  } catch { }
+  try {
+    const full = await maybeFullSync(90_000, { gapMs: 2 * 60_000 })
+    changed += full.added
+  } catch { }
+  try { void dedupeDeliveredReminders() } catch { }
+  try { await reschedulePickupReminders() } catch { }
+  try { syncPickupActivity() } catch { }
+  try {
+    markWidgetSynced()
+    writeWidgetSnapshot()
+  } catch { }
+  return { changed, fetched: true }
 }

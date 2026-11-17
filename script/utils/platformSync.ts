@@ -23,7 +23,7 @@ import { miHasLogin, miFetchList, miFetchDetail, parseMiTraces, type MiExpressIt
 import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, trackMailNo as cnTrackMailNo } from "./cainiao"
 import { notify } from "../ui/notify"
 import { warningIconData } from "./notifyIcon"
-import { orderForManualSync, shouldStartHumanVerify, tagSyncError } from "./syncSafety"
+import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel } from "./syncSafety"
 import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 type Source = "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
@@ -686,11 +686,13 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
 /* ---------------- 手动/打开 App 时的全量同步：发现新订单 ---------------- */
 
 /** 全量同步三个平台（只跑已授权的），把结果并进包裹列表 */
-export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean }): Promise<PlatformSyncReport> {
+export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean; gapMs?: number }): Promise<PlatformSyncReport> {
   const report: PlatformSyncReport = { added: 0, updated: 0, errors: [], skipped: [], ran: [], results: {} }
   const deadline = opts?.deadline ?? Number.POSITIVE_INFINITY
   const timeUp = () => Date.now() > deadline
   const before = getPickups().length
+  const cap = platformCapability()
+  const gapMs = opts?.force ? 0 : (opts?.gapMs ?? fullGapMs())
 
   // 平台顺序每轮轮换 + 每个平台自己记「上次成功时间」。
   // 组件里预算只有 18 秒，固定顺序会让排在最后那个永远吃不到预算 —— 用户指出的这个是真 bug。
@@ -698,9 +700,10 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   const only = opts?.only?.length ? new Set(opts.only) : null
   const ids: string[] = []
   // 未授权不是错误：界面已经有「未授权」状态，再往 errors 里塞一条会让用户以为同步失败
-  if (taobaoHasLogin() && platformCapability().taobao && platformEnabled("taobao") && (!only || only.has("taobao"))) ids.push("taobao")
-  if (jdHasLogin() && platformCapability().jd && (!only || only.has("jd"))) ids.push("jd")
-  if (pddHasLogin() && platformCapability().pdd && (!only || only.has("pdd"))) ids.push("pdd")
+  // 淘宝/京东/拼多多发现新单要 WebView：没能力时仍列入，循环里记跳过原因，避免小组件把「没跑」当成失败连败。
+  if (taobaoHasLogin() && platformEnabled("taobao") && (!only || only.has("taobao"))) ids.push("taobao")
+  if (jdHasLogin() && (!only || only.has("jd"))) ids.push("jd")
+  if (pddHasLogin() && (!only || only.has("pdd"))) ids.push("pdd")
   if (fcHasLogin() && (!only || only.has("fengchao"))) ids.push("fengchao")
   if (miHasLogin() && (!only || only.has("mi"))) ids.push("mi")
   // 菜鸟共用淘宝登录态（mtop 直连，不开网页）；没开菜鸟开关就不跑
@@ -710,24 +713,33 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   // 手动全量让菜鸟先跑：它不依赖 WebView。自动/组件同步仍轮换。
   const ordered = opts?.force ? orderForManualSync(ids) : rotateOrder(ids)
   // 本轮即将同步的平台先清旧失败，再写本轮结果（带版本和时间）
-  if (opts?.force && ordered.length) clearPlatformLastError(ordered)
+  if (opts?.force && ordered.length) {
+    clearPlatformLastError(ordered)
+    clearPlatformLastSkip(ordered)
+  }
   for (const id of ordered) {
-    // 3 小时内成功过就不重拉：App 和组件共用一个时间戳，谁跑过另一边就跳过
-    // force=true（用户点「立即同步」）时无视闸门，否则手动同步会被刚跑过的组件卡住。
-    if (!opts?.force && Date.now() - (Number(succeededAt[id]) || 0) < fullGapMs()) continue
+    if (!opts?.force && !platformDue(succeededAt[id], gapMs)) {
+      const msg = `距上次成功不足 ${gapLabel(gapMs)}，已跳过`
+      skipPlatform(report, id, msg)
+      continue
+    }
+    const needWv = id === "taobao" || id === "jd" || id === "pdd"
+    if (needWv && !cap[id as "taobao" | "jd" | "pdd"]) {
+      const msg = "当前环境没有 WebView，请在 App 内同步"
+      skipPlatform(report, id, msg)
+      continue
+    }
     if (timeUp()) {
       const msg = "时间不够，已跳过"
       report.errors.push(`${PLAT_LABEL[id] ?? id}：${msg}`)
-      report.skipped!.push(msg)
-      setResult(report, id, "skipped", msg)
+      skipPlatform(report, id, msg)
       continue
     }
     // 京东排队页是设备级风控：反复开页会不断刷新冷却计时。撞上后 30 分钟内直接跳过，不再开 WebView
     if (id === "jd" && jdCooling()) {
       // 冷却中是我们主动避开风控，不是故障 —— 不写 errors，但要让界面说清楚
       onProgress?.("京东冷却中，稍后自动恢复…")
-      report.skipped!.push("京东冷却中，稍后自动恢复")
-      setResult(report, id, "skipped", "冷却中，稍后自动恢复")
+      skipPlatform(report, id, "冷却中，稍后自动恢复")
       continue
     }
     try {
@@ -901,6 +913,7 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
       }
       markPlatformLast(id)
       clearFailStreak(id as PlatformId)
+      clearPlatformLastSkip(id)
       setResult(report, id, "ok", "")
     } catch (e) {
       // 京东排队/限流：标记 30 分钟冷却，后续同步（含组件后台）不再撞墙
@@ -1082,6 +1095,61 @@ export function clearPlatformLastError(ids: string | string[]): void {
   } catch { }
 }
 
+const SKIP_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/syncSkip.json`
+
+function readSkipMap(): Record<string, { at: number; msg: string }> {
+  const v = readJsonFile(SKIP_FILE())
+  return (v && typeof v === "object") ? v : {}
+}
+
+/** 把跳过原因写到 App Group，设置页能看到（带版本和时间）。不覆盖成功时间。 */
+export function recordPlatformSkip(id: string, reason: string): void {
+  try {
+    const prev = readSkipMap()
+    const at = Date.now()
+    prev[id] = { at, msg: tagSyncError(reason, at) }
+    writeJsonFile(SKIP_FILE(), prev)
+  } catch { }
+}
+
+export function clearPlatformLastSkip(ids: string | string[]): void {
+  const list = Array.isArray(ids) ? ids : [ids]
+  try {
+    const prev = readSkipMap()
+    let changed = false
+    for (const id of list) {
+      if (prev[id]) { delete prev[id]; changed = true }
+    }
+    if (changed) writeJsonFile(SKIP_FILE(), prev)
+  } catch { }
+}
+
+export function platformLastSkip(id: string): { at: number; msg: string } | null {
+  const e = readSkipMap()[id]
+  if (!e) return null
+  return { at: Number(e.at) || 0, msg: String(e.msg ?? "") }
+}
+
+/** 设置页展示：优先最近 3 小时内的失败，其次跳过原因。 */
+export function platformSyncHint(id: string): { kind: "error" | "skip"; at: number; msg: string } | null {
+  const err = platformLastError(id)
+  const skip = platformLastSkip(id)
+  const last = platformLastSyncedAt(id)
+  const fresh = (at: number) => Date.now() - at < 3 * 3_600_000
+  const errOk = err && fresh(err.at) && err.at >= last
+  const skipOk = skip && fresh(skip.at) && skip.at >= last
+  if (errOk && skipOk) return err!.at >= skip!.at ? { kind: "error", at: err!.at, msg: err!.msg } : { kind: "skip", at: skip!.at, msg: skip!.msg }
+  if (errOk) return { kind: "error", at: err!.at, msg: err!.msg }
+  if (skipOk) return { kind: "skip", at: skip!.at, msg: skip!.msg }
+  return null
+}
+
+function skipPlatform(report: PlatformSyncReport, id: string, msg: string): void {
+  recordPlatformSkip(id, msg)
+  report.skipped!.push(msg)
+  setResult(report, id, "skipped", tagSyncError(msg))
+}
+
 /** 轮换：每轮把指针往后挪一格，预算总是不够时也不会把同一平台饿死 */
 function rotateOrder(ids: string[]): string[] {
   if (ids.length <= 1) return ids
@@ -1093,6 +1161,7 @@ function rotateOrder(ids: string[]): string[] {
 
 /** 全量同步时间戳放共享目录：App 和小组件是两个进程，各存一份 Storage 就做不到“谁跑过另一边跳过” */
 const FULL_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/fullSync.json`
+const FULL_LOCK_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/fullSyncLock.json`
 
 export function readFullSyncAt(): number {
   let best = 0
@@ -1119,33 +1188,42 @@ export function markFullSyncAt(at = Date.now()): void {
 /** 每 3 小时跑一次全量（发现新订单）。App 与小组件共用一个时间戳，谁先跑过另一边就跳过。
  * budgetMs：到点就停，剩下的下次再补（小组件渲染有硬超时）。
  */
-export async function maybeFullSync(budgetMs = 60_000): Promise<number> {
-  const cap = platformCapability()
-  // 只授权了丰巢/小米的用户以前永远进不来（只判断了淘宝/京东/拼多多），
-  // 结果“每 3 小时自动同步”对他们完全失效。
-  const anyLogin = taobaoHasLogin() || (cap.jd && jdHasLogin()) || (cap.pdd && pddHasLogin())
-    || fcHasLogin() || miHasLogin()
-  if (!anyLogin) return 0
+/** 打开 App / 下拉刷新时的每平台全量间隔：跟着前台刷新设置，至少 15 分钟，不再用 3 小时总闸。 */
+export function foregroundFullGapMs(): number {
+  const appMin = Math.max(5, Number(getSettings().refreshAppMin) || 20)
+  return Math.max(15, appMin) * 60_000
+}
 
-  const last = readFullSyncAt()
-  if (Date.now() - last < fullGapMs()) return 0
-  // 先占位，避免两个进程同时拉同一批
-  markFullSyncAt()
+export type MaybeFullSyncResult = { added: number; attempted: boolean; ok: string[] }
+
+/** 每平台到期才发现新订单。不再用「任意平台刚跑过」的全局 3 小时闸门挡住淘宝：
+ *  小组件常先跑通菜鸟/小米/丰巢并写入 fullSync 时间戳，原先会让 App 打开时整轮直接 return。
+ *  短锁只防两进程同时开跑，不挡到期平台。
+ */
+export async function maybeFullSync(budgetMs = 60_000, opts?: { gapMs?: number; force?: boolean }): Promise<MaybeFullSyncResult> {
+  const empty: MaybeFullSyncResult = { added: 0, attempted: false, ok: [] }
+  const anyLogin = taobaoHasLogin() || jdHasLogin() || pddHasLogin() || fcHasLogin() || miHasLogin()
+  if (!anyLogin) return empty
+
+  const lockMs = 20_000
+  const lastStart = Number(readJsonFile(FULL_LOCK_FILE())?.at ?? 0) || 0
+  if (!opts?.force && Date.now() - lastStart < lockMs) return empty
+  try { writeJsonFile(FULL_LOCK_FILE(), { at: Date.now() }) } catch { }
 
   const before = getPickups().length
   let report: PlatformSyncReport | null = null
   try {
-    report = await syncPlatformParcels(undefined, { silent: true, deadline: Date.now() + budgetMs })
+    report = await syncPlatformParcels(undefined, {
+      silent: true,
+      deadline: Date.now() + budgetMs,
+      gapMs: opts?.force ? 0 : (opts?.gapMs ?? fullGapMs()),
+      force: opts?.force,
+    })
   } catch { }
-  // 本轮平台一个也没成功：把“刚同步过”的时间戳退回去，冷却后就能重试，
-  // 否则会白等一个 fullSyncHours 周期（P2-6）。
-  try {
-    const ran = report?.ran?.length ?? 0
-    const okAny = Object.values(report?.results ?? {}).some((r: any) => r?.outcome === "ok")
-    if (ran > 0 && !okAny) {
-      const cool = Math.max(5, Number(getSettings().failCoolMin) || 30) * 60_000
-      markFullSyncAt(Date.now() - fullGapMs() + cool)
-    }
-  } catch { }
-  return Math.max(0, getPickups().length - before)
+  const ok = Object.entries(report?.results ?? {})
+    .filter(([, r]) => (r as any)?.outcome === "ok")
+    .map(([id]) => id)
+  if (ok.length) markFullSyncAt()
+  const attempted = (report?.ran?.length ?? 0) > 0 || Object.keys(report?.results ?? {}).length > 0
+  return { added: Math.max(0, getPickups().length - before), attempted, ok }
 }
