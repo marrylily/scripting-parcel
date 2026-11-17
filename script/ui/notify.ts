@@ -1,3 +1,4 @@
+import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
 // 轻提示的全局状态（不依赖 UI，后台逻辑也能调；界面由 ui/toast.tsx 渲染）
 export type ToastLevel = "info" | "warn" | "error"
 
@@ -19,11 +20,12 @@ export function notify(text: string, level: ToastLevel = "info") {
   if (!clean) return
   const item: ToastItem = { id: ++seq, text: clean, level }
   listeners.forEach(l => l(item))
-  if (timer) clearTimeout(timer)
-  timer = setTimeout(() => {
+  if (timer) safeClearTimeout(timer)
+  const { id, scheduled } = tryScheduleTimeout(() => {
     listeners.forEach(l => l(null))
     timer = null
   }, 3000)
+  timer = scheduled ? id : null
 }
 
 export function onToast(l: Listener): () => void {

@@ -26,6 +26,7 @@ import {
 import { trackMailNo } from "../utils/cainiao"
 import { pddTrack } from "../utils/pddExpress"
 import { pddHasLogin } from "../utils/pdd"
+import { safeTimeoutRace, tryScheduleTimeout } from "../utils/safeTimer"
 
 type Closer = () => void
 
@@ -500,10 +501,7 @@ async function roadBetween(a: Pt, b: Pt): Promise<LatLng[]> {
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${a.longitude},${a.latitude};${b.longitude},${b.latitude}?geometries=geojson&overview=simplified`
     // fetch 不带超时会一直挂着（不报错），外面就一直画不出线
-    const r = await Promise.race([
-      fetch(url),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500)),
-    ]) as any
+    const r = await safeTimeoutRace(fetch(url), 3500, "timeout") as any
     const j: any = await r.json()
     const coords: number[][] = j?.routes?.[0]?.geometry?.coordinates ?? []
     if (coords.length < 2) throw new Error("no route")
@@ -728,13 +726,13 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
       const { fcOpenBox } = await import("../utils/fengchao")
       await fcOpenBox(box)
       setOpenMsg("柜门已开，请取件")
-      setTimeout(() => setOpenMsg(""), 6000)
+      tryScheduleTimeout(() => setOpenMsg(""), 6000)
     } catch (e: any) {
       const text = String(e?.message ?? e)
       setOpenFailed(true)
       // 文案太长就截断，气泡本身不限行数但别挡住地图
       setOpenMsg(text.length > 40 ? text.slice(0, 40) + "…" : text)
-      setTimeout(() => { setOpenMsg(""); setOpenFailed(false) }, 8000)
+      tryScheduleTimeout(() => { setOpenMsg(""); setOpenFailed(false) }, 8000)
     } finally {
       OPENING.delete(key)
       setOpening(false)
@@ -871,7 +869,7 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
                   <Button action={() => {
                     void Pasteboard.setString(mailNo)
                     setCopied(true)
-                    setTimeout(() => setCopied(false), 1200)
+                    tryScheduleTimeout(() => setCopied(false), 1200)
                   }}>
                     <Text font={12} foregroundStyle={C.accent}>{copied ? "已复制" : "复制"}</Text>
                   </Button>
@@ -945,7 +943,7 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
                 <Button action={() => {
                   void Pasteboard.setString(pickupCode)
                   setCopiedCode(true)
-                  setTimeout(() => setCopiedCode(false), 1200)
+                  tryScheduleTimeout(() => setCopiedCode(false), 1200)
                 }}>
                   <HStack spacing={4} padding={{ horizontal: 11, vertical: 7 }} contentShape="rect"
                     background={{ style: C.track, shape: CAPSULE }}>

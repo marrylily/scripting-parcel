@@ -6,6 +6,7 @@ import { C } from "../theme"
 import { Section, SubPage } from "./kit"
 import { fcLogin, fcMobile, fcSendCode } from "../utils/fengchao"
 import { notify } from "./notify"
+import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
 
 export function FengchaoLoginPage({ close, bump, onDone }: { close: () => void; bump: () => void; onDone?: () => void }) {
   const [phone, setPhone] = useState(fcMobile())
@@ -16,8 +17,8 @@ export function FengchaoLoginPage({ close, bump, onDone }: { close: () => void; 
 
   useEffect(() => {
     if (left <= 0) return
-    const t = setTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000)
-    return () => clearTimeout(t)
+    const { id: t, scheduled } = tryScheduleTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000); if (!scheduled) { /* 倒计时不可用则停在当前秒 */ }
+    return () => safeClearTimeout(t)
   }, [left])
 
   const phoneOk = /^1\d{10}$/.test(phone.replace(/\D/g, ""))
