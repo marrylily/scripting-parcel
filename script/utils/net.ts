@@ -2,7 +2,8 @@ import { COOKIE_KEY, Pkg, Snapshot, classify, closedOrderStatus, timeOfTrack, is
 import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded, formatBudgetExhausted, remainingMs } from "./syncSafety"
 import { safeTimeoutRace, tryScheduleTimeout, safeClearTimeout, isTimerUnavailable } from "./safeTimer"
 import { beginTaobaoDiag, recordTaobaoStep, finishTaobaoDiag, abandonTaobaoDiag } from "./taobaoTrace"
-import { evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
+import { canBoundPageLoad, evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
+import { attachNavWatch, formatObservedTimeout, redactLocation } from "./navWatch"
 import { SyncSuperseded, bindRunCleanup, isSupersededError, runIsCurrent } from "./syncGate"
 import { classifySalvage, formatDiscoveryFailure, type StageHit } from "./taobaoDiscover"
 
@@ -381,21 +382,37 @@ function openTaobaoPage(ctx: TaobaoRun): WebViewController {
 }
 
 async function seedCookies(controller: WebViewController, ctx: TaobaoRun): Promise<void> {
-  for (const cookie of getCookies()) {
+  const cookies = getCookies()
+  let planned = 0
+  let accepted = 0
+  let failed = 0
+  for (const cookie of cookies) {
     throwIfStopped(ctx)
+    planned++
     const cap = waitCap(ctx.deadline, 5_000)
-    if (cap < 200) throw budgetError(ctx)
+    if (cap < 200) {
+      failed += cookies.length - planned + 1
+      break
+    }
     try {
       const result = await settleWithin(
-        () => Promise.resolve(controller.setCookie(cookie)).then(() => true, () => false),
+        () => Promise.resolve(controller.setCookie(cookie)).then((v: any) => v !== false, () => false),
         cap,
         { schedule: tryScheduleTimeout, clear: safeClearTimeout, nativeBound: false },
       )
-      if (!result.ok && result.reason === "capability") throw new PageCapabilityError()
+      if (!result.ok && result.reason === "capability") {
+        failed += cookies.length - planned + 1
+        if (!canBoundPageLoad(controller as any)) throw new PageCapabilityError()
+        break
+      }
+      if (!result.ok || result.value !== true) failed++
+      else accepted++
     } catch (e) {
-      if (isSupersededError(e) || isPageCapability(e) || /预算用尽/.test(String((e as any)?.message ?? e))) throw e
+      if (isSupersededError(e) || /预算用尽/.test(String((e as any)?.message ?? e))) throw e
+      failed++
     }
   }
+  recordTaobaoStep("写入登录态", 0, failed === 0, undefined, `计划${planned} 接受${accepted} 失败${failed}`, ctx.diagId)
 }
 
 /**
@@ -600,7 +617,7 @@ function hitFromError(e: any): StageHit {
   const detail = String(e?.message ?? e)
   if (isPageCapability(e) || /页面计时不可用/.test(detail)) return { type: "stop", reason: "capability", detail }
   if (/预算用尽/.test(detail)) return { type: "stop", reason: "budget", detail }
-  if (/需重新登录|登录已失效/.test(detail)) return { type: "stop", reason: "auth", detail }
+  if (/需重新登录|登录已失效|前台完成登录|不能自动跳过验证/.test(detail)) return { type: "stop", reason: "auth", detail }
   return { type: "miss", detail }
 }
 
@@ -616,17 +633,28 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
     const t0 = Date.now()
     const label = i ? `${step}（重试）` : step
     let recorded = false
+    let watch: Awaited<ReturnType<typeof attachNavWatch>> | null = null
     try {
       if (deadlineReached(ctx.deadline)) throw budgetError(ctx, url)
       const cap = waitCap(ctx.deadline, ms)
       if (cap < 1000) throw budgetError(ctx, url)
+      watch = await attachNavWatch(controller as any, t0)
       try {
-        await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout, stopOnTimeout)
-      } catch (e) {
-        if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
-        if (isPageCapability(e)) throw e
-        if (isPageTimeout(e)) throw new Error(formatStepTimeout(step, Date.now() - t0, url))
-        throw e
+        try {
+          await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout, stopOnTimeout)
+        } catch (e) {
+          if (watch?.authDetail) throw new Error(watch.authDetail)
+          if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
+          if (isPageCapability(e)) throw e
+          if (isPageTimeout(e)) throw new Error(formatObservedTimeout(step, Date.now() - t0, url, watch?.lastLocation || ""))
+          throw e
+        }
+        if (watch?.authDetail) throw new Error(watch.authDetail)
+      } finally {
+        for (const ev of watch?.events ?? []) {
+          recordTaobaoStep(`导航·${ev.type}`, ev.atMs, ev.kind === "other" || ev.kind === "empty", undefined, `${ev.location || "无"} id=${ev.navigationId}`, ctx.diagId)
+        }
+        try { await watch?.stop() } catch { /* 移除监听失败不改变本次加载结论 */ }
       }
       throwIfStopped(ctx)
       const auth = await inspectAuthOrVerify(controller, ctx)
@@ -638,9 +666,15 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
       if (isSupersededError(e)) throw e
       const err = e instanceof Error ? e : new Error(String(e?.message ?? e))
       last = err
-      if (!recorded) recordTaobaoStep(label, Date.now() - t0, false, url, String(err.message || "").slice(0, 80), ctx.diagId)
       const msg = String(err.message || "")
-      if (stopsDiscovery(e) || /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用/.test(msg)) throw err
+      if (!recorded) {
+        const observed = watch?.lastLocation || "无"
+        const note = /超时/.test(msg)
+          ? `请求 ${redactLocation(url) || "无"} 观察到 ${observed}`
+          : msg
+        recordTaobaoStep(label, Date.now() - t0, false, undefined, note, ctx.diagId)
+      }
+      if (stopsDiscovery(e) || /需重新登录|登录已失效|前台完成登录|不能自动跳过验证|预算用尽|页面计时不可用/.test(msg)) throw err
     }
   }
   throw last || new Error(formatStepTimeout(step, ms, url))
@@ -691,7 +725,7 @@ async function salvageH5(controller: WebViewController, ctx: TaobaoRun): Promise
     let info: any = {}
     try { info = JSON.parse(raw) } catch { info = {} }
     const ids = String(info.ids || "").split(",").map((id: string) => id.trim()).filter(Boolean)
-    const href = String(info.href || "")
+    const href = redactLocation(String(info.href || ""))
     const verify = !!info.verify
     const auth = verify || salvageLooksLikeAuth(String(info.host || ""), href)
     const cls = classifySalvage({
@@ -711,18 +745,16 @@ async function salvageH5(controller: WebViewController, ctx: TaobaoRun): Promise
       recordTaobaoStep("超时后读取H5", Date.now() - t0, false, href, "登录或验证", ctx.diagId)
       return { type: "stop", reason: "auth", detail }
     }
-    if (cls === "empty-ready") {
-      recordTaobaoStep("超时后读取H5", Date.now() - t0, true, href, "页面确认没有订单", ctx.diagId)
-      return { type: "empty-ready", detail: "淘宝·H5页面确认没有订单" }
-    }
-    recordTaobaoStep("超时后读取H5", Date.now() - t0, false, href, "无订单数据", ctx.diagId)
-    return { type: "miss", detail: "淘宝·超时后读取H5无订单数据" }
+    recordTaobaoStep("超时后读取H5", Date.now() - t0, false, href, "页面未完成，不作为空单", ctx.diagId)
+    return { type: "miss", detail: "淘宝·超时后页面未完成，不作为空单" }
   } catch (e) {
     if (isSupersededError(e)) throw e
     const hit = hitFromError(e)
-    if (hit.type === "stop") return hit
+    if (hit.type === "stop" && hit.reason === "auth") return hit
+    if (hit.type === "stop" && hit.reason === "budget") return hit
+    if (hit.type === "stop" && hit.reason === "capability" && !canBoundPageLoad(controller as any)) return hit
     recordTaobaoStep("超时后读取H5", Date.now() - t0, false, undefined, "未能读取", ctx.diagId)
-    return { type: "miss", detail: "淘宝·超时后读取H5无订单数据" }
+    return { type: "miss", detail: "淘宝·超时后读取失败，继续下一路径" }
   }
 }
 
@@ -791,7 +823,6 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
       if (/超时/.test(hit.detail)) {
         const salvage = await salvageH5(controller, ctx)
         if (salvage.type === "orders") { markPage(ctx, true); return salvage.ids }
-        if (salvage.type === "empty-ready") { markPage(ctx, true); return [] }
         if (salvage.type === "stop") throw new Error(salvage.detail)
       }
       stages.push(hit.detail)

@@ -115,6 +115,12 @@ export async function settleWithin<T>(start: () => Promise<T>, ms: number, opts:
   }
 }
 
+/** 官方 loadRequest 或 waitForLoad 的 timeout 能限制加载。只有 loadURL 时必须有脚本计时器。 */
+export function canBoundPageLoad(page: PageSurface): boolean {
+  return typeof page.loadRequest === "function"
+    || (typeof page.waitForLoad === "function" && typeof page.loadURL === "function")
+}
+
 function stopQuiet(page: PageSurface): void {
   try { silence(page.stopLoading?.()) } catch { /* 页面可能已经关掉 */ }
 }
