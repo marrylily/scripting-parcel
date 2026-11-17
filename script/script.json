@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.6 remote-update edition. Clearer Taobao timeouts with step, duration and page path; retries; login/verify distinguished from timeout. Auth and keys unchanged.",
+  "description": "ParcelPal 1.2.7 remote-update edition. Taobao sync uses per-run diagnostics, one page lock, and official WebView timeouts so a hung load cannot leave the button spinning. Does not guarantee proxy connectivity. Auth and keys unchanged.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.6 远程更新版：淘宝超时会写出步骤、耗时和当前页面路径，可重试一步，登录/验证页不再误报成超时。登录与密钥逻辑未改。",
-    "en": "1.2.6 remote-update edition. Taobao timeouts name the step, duration and page path; retry once; login/verify is not reported as a timeout. Auth and keys unchanged."
+    "zh": "1.2.7 远程更新版：淘宝同步按轮次记录诊断，同一时间只开一轮页面；加载使用官方超时，结束后按钮会收回。不保证代理网络一定能连上。登录与密钥逻辑未改。",
+    "en": "1.2.7 remote-update edition. Taobao sync keeps per-run diagnostics and one page at a time. Loads use the official timeout, and the button resets when the round ends. This does not guarantee proxy connectivity. Auth and keys unchanged."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",

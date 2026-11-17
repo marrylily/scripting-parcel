@@ -1,11 +1,12 @@
 import { COOKIE_KEY, Pkg, Snapshot, classify, closedOrderStatus, timeOfTrack, isHistoricalPkg, statusFromCode } from "./model"
-import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded } from "./syncSafety"
-import { safeDelay, safeTimeoutRace } from "./safeTimer"
-import { beginTaobaoDiag, recordTaobaoStep, finishTaobaoDiag } from "./taobaoTrace"
+import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded, formatBudgetExhausted } from "./syncSafety"
+import { safeTimeoutRace, tryScheduleTimeout, safeClearTimeout, isTimerUnavailable } from "./safeTimer"
+import { beginTaobaoDiag, recordTaobaoStep, finishTaobaoDiag, abandonTaobaoDiag } from "./taobaoTrace"
+import { evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
+import { SyncSuperseded, bindRunCleanup, isSupersededError, runIsCurrent } from "./syncGate"
 
 /** 运行时全局 fetch（类型声明里没导出，跟 Response 情况一样） */
 declare const fetch: any
-const delay = (ms: number) => safeDelay(ms)
 
 const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
@@ -250,7 +251,7 @@ async function fetchText(url: string, ms = 25_000): Promise<string> {
 }
 
 /** 用登录态拉一条订单的物流（不依赖 WebView，小组件里也能跑） */
-export async function fetchPackage(orderId: string, prev?: Pkg): Promise<Pkg> {
+export async function fetchPackage(orderId: string, prev?: Pkg, run?: { diagId?: number }): Promise<Pkg> {
   const t0 = Date.now()
   let logisticsHtml = ""
   let lastErr: any
@@ -264,7 +265,7 @@ export async function fetchPackage(orderId: string, prev?: Pkg): Promise<Pkg> {
     }
   }
   if (lastErr) {
-    recordTaobaoStep("拉物流页", Date.now() - t0, false, LOGISTICS_URL(orderId))
+    recordTaobaoStep("拉物流页", Date.now() - t0, false, LOGISTICS_URL(orderId), String(lastErr?.message ?? lastErr), run?.diagId)
     throw lastErr
   }
   const info = parseLogistics(logisticsHtml)
@@ -310,30 +311,120 @@ export async function fetchPackage(orderId: string, prev?: Pkg): Promise<Pkg> {
 /** 淘宝拦截页词表：只有真滑块/验证才值得弹页给人，限流类等一下自己就过 */
 const TB_VERIFY_RE = /滑动验证|请完成验证|安全验证|人机验证|滑块验证|验证码|captcha/i
 
+
+
+type TaobaoRun = {
+  diagId: number
+  syncId: string | null
+  roundStart: number
+  deadline?: number
+  dispose?: () => void
+}
+
+function throwIfStopped(ctx: TaobaoRun): void {
+  if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) {
+    try { ctx.dispose?.() } catch { /* 控制器可能已经释放 */ }
+    throw new SyncSuperseded()
+  }
+}
+
+function budgetError(ctx: TaobaoRun, url?: string): Error {
+  return new Error(formatBudgetExhausted(Date.now() - ctx.roundStart, url))
+}
+
+function markPage(ctx: TaobaoRun, ok: boolean): void {
+  if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) return
+  lastTaobaoPageOk = ok
+}
+
+/** 间隔等待。排不上计时器就报能力错误，避免空转把页面脚本打满。 */
+async function pause(ms: number, ctx: TaobaoRun): Promise<void> {
+  throwIfStopped(ctx)
+  const cap = waitCap(ctx.deadline, ms)
+  if (cap <= 0) throw budgetError(ctx)
+  await new Promise<void>((resolve, reject) => {
+    const { scheduled } = tryScheduleTimeout(() => resolve(), cap)
+    if (!scheduled) reject(new PageCapabilityError())
+  })
+}
+
+async function evalPage<T>(controller: WebViewController, js: string, ms: number, step: string, ctx: TaobaoRun): Promise<T> {
+  throwIfStopped(ctx)
+  const cap = waitCap(ctx.deadline, ms)
+  if (cap < 200) throw budgetError(ctx)
+  const t0 = Date.now()
+  try {
+    return await evaluateBounded<T>(controller as any, js, cap, step, tryScheduleTimeout, safeClearTimeout)
+  } catch (e) {
+    if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) {
+      try { ctx.dispose?.() } catch { /* 同上 */ }
+      throw new SyncSuperseded()
+    }
+    if (isPageTimeout(e)) throw new Error(formatStepTimeout(step, Date.now() - t0))
+    throw e
+  }
+}
+
+function openTaobaoPage(ctx: TaobaoRun): WebViewController {
+  const controller = new WebViewController()
+  let closed = false
+  const dispose = () => {
+    if (closed) return
+    closed = true
+    try { void (controller as any).stopLoading?.() } catch { /* 没有这个方法时直接释放 */ }
+    try { controller.dispose() } catch { /* 重复释放忽略 */ }
+  }
+  ctx.dispose = dispose
+  if (ctx.syncId != null) bindRunCleanup(ctx.syncId, dispose)
+  return controller
+}
+
+async function seedCookies(controller: WebViewController, ctx: TaobaoRun): Promise<void> {
+  for (const cookie of getCookies()) {
+    throwIfStopped(ctx)
+    const cap = waitCap(ctx.deadline, 5_000)
+    if (cap < 200) throw budgetError(ctx)
+    try {
+      const result = await settleWithin(
+        () => Promise.resolve(controller.setCookie(cookie)).then(() => true, () => false),
+        cap,
+        { schedule: tryScheduleTimeout, clear: safeClearTimeout, nativeBound: false },
+      )
+      if (!result.ok && result.reason === "capability") throw new PageCapabilityError()
+    } catch (e) {
+      if (isSupersededError(e) || isPageCapability(e) || /预算用尽/.test(String((e as any)?.message ?? e))) throw e
+    }
+  }
+}
+
 /**
  * 淘宝人机验证：和京东 humanVerify 同构——把页面弹给用户过滑块，
  * 过了（Ultron 数据里重新出现订单）自动收起并返回 true。
+ * 加载和每次读页面都有上限，不再无限等 loadURL / evaluateJavaScript。
  */
-export async function taobaoHumanVerify(): Promise<boolean> {
-  const controller = new WebViewController()
+export async function taobaoHumanVerify(deadline?: number, syncId: string | null = null): Promise<boolean> {
+  const ctx: TaobaoRun = { diagId: 0, syncId, roundStart: Date.now(), deadline }
+  const controller = openTaobaoPage(ctx)
   try {
-    for (const cookie of getCookies()) {
-      try { await controller.setCookie(cookie) } catch { }
-    }
+    await seedCookies(controller, ctx)
+    const cap = waitCap(deadline, 25_000)
+    if (cap < 1000) return false
     try {
-      await controller.loadURL("https://h5.m.taobao.com/mlapp/olist.html")
-      try { await waitPage(controller, 25000, "验证页加载") } catch { }
-    } catch { }
+      await loadPageBounded(controller as any, "https://h5.m.taobao.com/mlapp/olist.html", cap, "验证页加载", tryScheduleTimeout, safeClearTimeout)
+    } catch (e) {
+      if (isSupersededError(e) || (ctx.syncId != null && !runIsCurrent(ctx.syncId))) throw new SyncSuperseded()
+      return false
+    }
     let presented = true
     const p = controller.present({ fullscreen: true, navigationTitle: "淘宝需要验证" })
       .then(() => { presented = false })
       .catch(() => { presented = false })
-    const deadline = Date.now() + 3 * 60_000
+    const end = Math.min(Date.now() + 3 * 60_000, deadline ?? Number.POSITIVE_INFINITY)
     let ok = false
-    while (presented && Date.now() < deadline) {
-      await delay(1500)
+    while (presented && Date.now() < end) {
+      await pause(1500, ctx)
       if (!presented) break
-      const raw = String(await controller.evaluateJavaScript<string>(`return (function(){
+      const raw = String(await evalPage<string>(controller, `return (function(){
         try{
           var s = window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''
           var t = document.body ? document.body.innerText.slice(0, 500) : ''
@@ -342,17 +433,19 @@ export async function taobaoHumanVerify(): Promise<boolean> {
             bad: /滑动验证|请完成验证|安全验证|人机验证|滑块验证|验证码|captcha/i.test(t)
           })
         }catch(e){ return '{}' }
-      })()`) || "{}")
+      })()`, 4_000, "读取验证页", ctx) || "{}")
       let info: any = {}
       try { info = JSON.parse(raw) } catch { }
       if (info.has && !info.bad) { ok = true; break }
     }
     if (presented) { try { await controller.dismiss() } catch { } }
-    try { await p } catch { }
-    await delay(400)
+    void p
+    try { await pause(400, ctx) } catch (e) {
+      if (isSupersededError(e)) throw e
+    }
     return ok
   } finally {
-    try { controller.dispose() } catch { }
+    try { ctx.dispose?.() } catch { /* 验证页用完就释放 */ }
   }
 }
 
@@ -418,20 +511,32 @@ const CLEAR_OVERLAYS = `return (function(){
 
 /**
  * 等订单列表真的渲染出来：每 700ms 看一眼 DOM，没列表就顺手清一次遮挡并滚到底。
- * 思路同 handycode 的 login-ready.js——先确认页面就绪再取数据，而不是加载完就硬抓。
+ * 每次读页面都有上限，不再另等一次加载事件。
  */
-async function waitForOrders(controller: WebViewController, maxMs: number): Promise<boolean> {
-  const end = Date.now() + maxMs
+async function waitForOrders(controller: WebViewController, maxMs: number, ctx: TaobaoRun): Promise<boolean> {
+  const end = Date.now() + waitCap(ctx.deadline, maxMs)
   while (Date.now() < end) {
+    throwIfStopped(ctx)
     try {
-      const rv: any = await controller.evaluateJavaScript(
-        "return (function(){try{var h=document.documentElement?document.documentElement.outerHTML:'';return /bizOrderId[=:\\\"%]+\\d{10,}/.test(h)?1:0}catch(e){return -1}})()")
+      const rv: any = await evalPage(
+        controller,
+        "return (function(){try{var h=document.documentElement?document.documentElement.outerHTML:'';return /bizOrderId[=:\\\"%]+\\d{10,}/.test(h)?1:0}catch(e){return -1}})()",
+        3_000,
+        "等待订单列表",
+        ctx,
+      )
       const ok = rv === 1 || rv === true || String(rv) === "1" || String(rv) === "true"
       if (ok) { diag("taobao-wait", { ok: true }); return true }
-    } catch { }
-    try { await controller.evaluateJavaScript(CLEAR_OVERLAYS) } catch { }
-    try { await controller.evaluateJavaScript("window.scrollTo(0, document.body.scrollHeight)") } catch { }
-    await delay(700)
+    } catch (e) {
+      if (isSupersededError(e) || isPageCapability(e) || /预算用尽|页面计时不可用/.test(String((e as any)?.message ?? e))) throw e
+    }
+    try { await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx) } catch (e) {
+      if (isSupersededError(e) || isPageCapability(e)) throw e
+    }
+    try { await evalPage(controller, "return (function(){try{window.scrollTo(0, document.body.scrollHeight);return 1}catch(e){return 0}})()", 2_000, "滚动订单列表", ctx) } catch (e) {
+      if (isSupersededError(e) || isPageCapability(e)) throw e
+    }
+    await pause(700, ctx)
   }
   diag("taobao-wait", { ok: false })
   return false
@@ -450,86 +555,81 @@ export function diag(tag: string, obj: any): void {
 }
 
 /** 当前页面是不是被踢回登录页了 */
-async function atLoginPage(controller: WebViewController): Promise<boolean> {
+async function atLoginPage(controller: WebViewController, ctx: TaobaoRun): Promise<boolean> {
   try {
-    const href = String(await controller.evaluateJavaScript<string>("return location.href") || "")
-    const host = String(await controller.evaluateJavaScript<string>("return location.host") || "")
+    const href = String(await evalPage<string>(controller, "return location.href", 2_000, "读取当前页", ctx) || "")
+    const host = String(await evalPage<string>(controller, "return location.host", 2_000, "读取当前页", ctx) || "")
     return /^login[\d.]*\.(taobao|tmall)\.com$/i.test(host)
       || /login\.m\.taobao\.com/i.test(host)
       || /(passport|havanaone|havana)\.(taobao|tmall)\.com/i.test(host)
       || /\/(member\/login|login\/login)/i.test(href)
-  } catch { return false }
+  } catch (e) {
+    if (isSupersededError(e) || isPageCapability(e) || /预算用尽|页面计时不可用|淘宝·/.test(String((e as any)?.message ?? e))) throw e
+    return false
+  }
 }
 
-async function currentPageUrl(controller: WebViewController): Promise<string> {
-  try { return String(await controller.evaluateJavaScript("return location.href") || "") } catch { return "" }
+async function currentPageUrl(controller: WebViewController, ctx: TaobaoRun): Promise<string> {
+  try { return String(await evalPage(controller, "return location.href", 2_000, "读取当前页", ctx) || "") } catch (e) {
+    if (isSupersededError(e) || isPageCapability(e)) throw e
+    return ""
+  }
 }
 
-async function pageReadyState(controller: WebViewController): Promise<string> {
-  try { return String(await controller.evaluateJavaScript("return document.readyState") || "") } catch { return "" }
-}
-
-async function inspectAuthOrVerify(controller: WebViewController): Promise<string | null> {
-  const href = await currentPageUrl(controller)
+async function inspectAuthOrVerify(controller: WebViewController, ctx: TaobaoRun): Promise<string | null> {
+  const href = await currentPageUrl(controller, ctx)
   let text = ""
-  try { text = String(await controller.evaluateJavaScript("return document.body ? document.body.innerText.slice(0, 800) : ''") || "") } catch { }
-  if (await atLoginPage(controller) || /(passport|havana)\.(taobao|tmall)\.com/i.test(href)) return formatAuthNeeded(href)
+  try { text = String(await evalPage(controller, "return document.body ? document.body.innerText.slice(0, 800) : ''", 3_000, "读取页面正文", ctx) || "") } catch (e) {
+    if (isSupersededError(e) || isPageCapability(e)) throw e
+  }
+  if (await atLoginPage(controller, ctx) || /(passport|havana)\.(taobao|tmall)\.com/i.test(href)) return formatAuthNeeded(href)
   if (TB_VERIFY_RE.test(text) || /punish|_____tmd_____|\/error\/captcha/i.test(href)) return formatAuthNeeded(href)
   return null
 }
 
 function isFatalTaobaoError(e: any): boolean {
+  if (isSupersededError(e) || isPageCapability(e)) return true
   const msg = String(e?.message ?? e)
-  return /需重新登录或完成验证|登录已失效|预算用尽|淘宝·/.test(msg)
+  return /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用|淘宝·/.test(msg)
 }
 
 /**
- * 用 Date.now() 限时等待页面就绪。
- * 不单独依赖 setTimeout：Timer 不可用时 pageTimeout 会一直等 waitForLoad，
- * 而 loadURL 往往已经等到过一次，第二次 waitForLoad 在单页应用里可能永不触发。
- * 若文档已经是 interactive/complete，立即返回。
+ * 只等一次官方加载。
+ * loadRequest 的 timeoutInterval（秒）或 waitForLoad({ timeout, cancelOnTimeout }) 负责上限。
+ * 加载成功后不再调用 waitForLoad，避免单页应用第二次加载事件一直不来。
  */
-async function waitPage(controller: WebViewController, ms: number, step: string): Promise<void> {
-  const t0 = Date.now()
-  const ready = async () => {
-    const st = await pageReadyState(controller)
-    return st === "complete" || st === "interactive"
-  }
-  try { if (await ready()) return } catch { }
-  let loaded = false
-  const pending = Promise.resolve(controller.waitForLoad()).then(() => { loaded = true }).catch(() => { })
-  const end = Date.now() + Math.max(0, ms)
-  while (!loaded && Date.now() < end) {
-    try { if (await ready()) return } catch { }
-    await delay(300)
-  }
-  void pending
-  try { if (await ready()) return } catch { }
-  if (loaded) return
-  throw new Error(formatStepTimeout(step, Date.now() - t0, await currentPageUrl(controller)))
-}
-
-async function loadAndWait(controller: WebViewController, url: string, ms: number, step: string, deadline?: number, retries = 1): Promise<void> {
+async function loadAndWait(controller: WebViewController, url: string, ms: number, step: string, ctx: TaobaoRun, retries = 1): Promise<void> {
   let last: Error | null = null
   for (let i = 0; i <= retries; i++) {
+    throwIfStopped(ctx)
     const t0 = Date.now()
     const label = i ? `${step}（重试）` : step
     let recorded = false
     try {
-      if (deadlineReached(deadline)) throw new Error(formatStepTimeout("整轮时间预算用尽", 0, url))
-      await controller.loadURL(url)
-      await waitPage(controller, ms, step)
-      const auth = await inspectAuthOrVerify(controller)
-      recordTaobaoStep(label, Date.now() - t0, !auth, url, auth || undefined)
+      if (deadlineReached(ctx.deadline)) throw budgetError(ctx, url)
+      const cap = waitCap(ctx.deadline, ms)
+      if (cap < 1000) throw budgetError(ctx, url)
+      try {
+        await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout)
+      } catch (e) {
+        if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
+        if (isPageCapability(e)) throw e
+        if (isPageTimeout(e)) throw new Error(formatStepTimeout(step, Date.now() - t0, url))
+        throw e
+      }
+      throwIfStopped(ctx)
+      const auth = await inspectAuthOrVerify(controller, ctx)
+      recordTaobaoStep(label, Date.now() - t0, !auth, url, auth || undefined, ctx.diagId)
       recorded = true
       if (auth) throw new Error(auth)
       return
     } catch (e: any) {
+      if (isSupersededError(e)) throw e
       const err = e instanceof Error ? e : new Error(String(e?.message ?? e))
       last = err
-      if (!recorded) recordTaobaoStep(label, Date.now() - t0, false, url, String(err.message || "").slice(0, 80))
+      if (!recorded) recordTaobaoStep(label, Date.now() - t0, false, url, String(err.message || "").slice(0, 80), ctx.diagId)
       const msg = String(err.message || "")
-      if (/需重新登录或完成验证|登录已失效|预算用尽/.test(msg)) throw err
+      if (isPageCapability(e) || /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用/.test(msg)) throw err
     }
   }
   throw last || new Error(formatStepTimeout(step, ms, url))
@@ -537,41 +637,42 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
 
 /**
  * 发现账号下的订单号。
- * 主线路：PC 版「已买到的宝贝」，DOM 里直接带 bizOrderId。
- * 兜底：H5 订单页是 Ultron 渲染，读 window.currentUltronData。
+ * 主线路：H5 Ultron。快递聚合 3.0 实测稳定。
+ * 兜底：PC 版「已买到的宝贝」，DOM 里直接带 bizOrderId。
  */
 /** 上一轮淘宝订单页是否真的渲染出来了。
  *  订单为 0 有两种可能：页面没加载（故障）和用户确实没买东西（正常）。
  *  只有页面没就绪才算失败，否则会把“空订单”永远报成错误。*/
 let lastTaobaoPageOk = false
 
-export async function discoverOrderIds(deadline?: number): Promise<string[]> {
-  lastTaobaoPageOk = false
-  if (deadlineReached(deadline)) throw new Error(formatStepTimeout("整轮时间预算用尽", 0))
-  const controller = new WebViewController()
+export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
+  markPage(ctx, false)
+  if (deadlineReached(ctx.deadline)) throw budgetError(ctx)
+  const controller = openTaobaoPage(ctx)
   try {
-    for (const cookie of getCookies()) {
-      try { await controller.setCookie(cookie) } catch { }
-    }
+    await seedCookies(controller, ctx)
 
-    // 主线路：PC 版「已买到的宝贝」。H5 olist 会先弹「请选择」页头，列表根本不渲染。
-    // 淘宝 PC 订单页的 tab 参数（tab=wait_buyer_receive）实测不生效，页面仍返回全量列表；
-    // 所以改成「进页面后点自带的『待收货』tab」真正用平台筛选，再限量取最近的单。
-    // 主线路：H5 Ultron。快递聚合3.0 实测稳定（同一账号拿到 15 单，含历史单），
-    // 我们之前把它当“兜底”又把体积限制加坏了，才让 PC 页成为唯一线路。
     let needVerify = false
     try {
-      if (deadlineReached(deadline)) throw new Error(formatStepTimeout("整轮时间预算用尽", 0))
-      await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "加载H5订单页", deadline)
-      if (!await atLoginPage(controller)) {
+      if (deadlineReached(ctx.deadline)) throw budgetError(ctx)
+      await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "加载H5订单页", ctx)
+      if (!await atLoginPage(controller, ctx)) {
         let blob = ""
         for (let i = 0; i < 15; i++) {
-          if (deadlineReached(deadline)) break
-          blob = String(await controller.evaluateJavaScript<string>(
-            "return window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''") || "")
+          if (deadlineReached(ctx.deadline)) break
+          throwIfStopped(ctx)
+          blob = String(await evalPage<string>(
+            controller,
+            "return window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''",
+            4_000,
+            "读取H5订单",
+            ctx,
+          ) || "")
           if (blob.includes("bizOrderId") || blob.includes("orderId")) break
-          try { await controller.evaluateJavaScript("window.scrollTo(0, document.body.scrollHeight)") } catch { }
-          await delay(600)
+          try { await evalPage(controller, "return (function(){try{window.scrollTo(0, document.body.scrollHeight);return 1}catch(e){return 0}})()", 2_000, "滚动H5订单", ctx) } catch (e) {
+            if (isSupersededError(e) || isPageCapability(e)) throw e
+          }
+          await pause(600, ctx)
         }
         const h5Ids: string[] = []
         const pushH5 = (v: string) => { if (v && !h5Ids.includes(v)) h5Ids.push(v) }
@@ -579,184 +680,215 @@ export async function discoverOrderIds(deadline?: number): Promise<string[]> {
         for (const m of blob.matchAll(/"orderId":"(\d{10,})"/g)) pushH5(m[1])
         diag("taobao-h5", { len: blob.length, n: h5Ids.length })
         if (h5Ids.length > 0) {
-          lastTaobaoPageOk = true
+          markPage(ctx, true)
           return h5Ids.slice(0, 40)
         }
-        // 一条都没拿到：先别急着下结论，看看是不是弹了滑块
-        const vt = String(await controller.evaluateJavaScript(
-          "return document.body ? document.body.innerText.slice(0,500) : ''") || "")
+        const vt = String(await evalPage(
+          controller,
+          "return document.body ? document.body.innerText.slice(0,500) : ''",
+          3_000,
+          "读取H5正文",
+          ctx,
+        ) || "")
         if (TB_VERIFY_RE.test(vt)) needVerify = true
       }
     } catch (e: any) {
       if (isFatalTaobaoError(e)) throw e
     }
-    if (needVerify) throw new Error(formatAuthNeeded(await currentPageUrl(controller)))
+    if (needVerify) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
 
-    if (deadlineReached(deadline)) throw new Error(formatStepTimeout("整轮时间预算用尽", 0))
+    if (deadlineReached(ctx.deadline)) throw budgetError(ctx)
     const pcIds: string[] = []
     const pushPc = (v: string) => { if (v && !pcIds.includes(v)) pcIds.push(v) }
     let needLogin = false
     let pageOk = false
     try {
-      await loadAndWait(controller, "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm", 25_000, "加载PC订单页", deadline)
-      try { await controller.evaluateJavaScript(CLEAR_OVERLAYS) } catch { }
-      try { await controller.evaluateJavaScript(HOOK_XHR) } catch { }
-      // 被踢到登录页就别再猜「遮挡」——直接报登录失效，交给用户重新授权
-      if (await atLoginPage(controller)) needLogin = true
+      await loadAndWait(controller, "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm", 25_000, "加载PC订单页", ctx)
+      try { await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx) } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
+      try { await evalPage(controller, HOOK_XHR, 3_000, "挂钩请求", ctx) } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
+      if (await atLoginPage(controller, ctx)) needLogin = true
       try {
-        const raw = String(await controller.evaluateJavaScript(`return JSON.stringify({href:location.href,title:document.title,len:(document.documentElement?document.documentElement.outerHTML.length:0),hasOrder:/bizOrderId[=":%]+\\d{10,}/.test(document.documentElement?document.documentElement.outerHTML:''),text:(document.body?document.body.innerText.slice(0,200):'')})`) || "")
+        const raw = String(await evalPage(controller, `return JSON.stringify({href:location.href,title:document.title,len:(document.documentElement?document.documentElement.outerHTML.length:0),hasOrder:/bizOrderId[=":%]+\\d{10,}/.test(document.documentElement?document.documentElement.outerHTML:''),text:(document.body?document.body.innerText.slice(0,200):'')})`, 4_000, "读取PC订单页", ctx) || "")
         const pinfo: any = JSON.parse(raw || "{}")
         pageOk = String(pinfo.title || "").includes("已买到的宝贝") && Number(pinfo.len || 0) > 40000
         diag("taobao-pc", { title: pinfo.title, len: pinfo.len, has: pinfo.hasOrder, ok: pageOk })
-      } catch { }
-      // 页面就绪再动手：被弹层盖住/懒加载时先等列表出现，还没出现就重载一次再等
-      if (!needLogin && !await waitForOrders(controller, waitCap(deadline, 15_000))) {
-        try {
-          await loadAndWait(controller, "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm", 25_000, "重载PC订单页", deadline)
-          await controller.evaluateJavaScript(CLEAR_OVERLAYS)
-          if (await atLoginPage(controller)) needLogin = true
-        } catch { }
-        if (!needLogin) await waitForOrders(controller, waitCap(deadline, 12_000))
+      } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
       }
-      // 点页面自带的「待收货」筛选；点不到就用全量列表但限量
+      if (!needLogin && !await waitForOrders(controller, 15_000, ctx)) {
+        try {
+          await loadAndWait(controller, "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm", 25_000, "重载PC订单页", ctx)
+          await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx)
+          if (await atLoginPage(controller, ctx)) needLogin = true
+        } catch (e) {
+          if (isSupersededError(e) || isPageCapability(e) || isFatalTaobaoError(e)) throw e
+        }
+        if (!needLogin) await waitForOrders(controller, 12_000, ctx)
+      }
       let clickedPending = false
       try {
-        const hit = String(await controller.evaluateJavaScript(`return (function(){
+        const hit = String(await evalPage(controller, `return (function(){
           var t=[].slice.call(document.querySelectorAll('a,span,div,li')).find(function(e){
             var s=(e.textContent||'').trim(); return (s==='待收货'||s==='待收货订单')&&e.children.length<3 });
           if(t){ t.click(); return 'clicked'; } return 'no';
-        })()`) || "")
+        })()`, 4_000, "点待收货", ctx) || "")
         clickedPending = hit.indexOf("clicked") >= 0
-        // 点 tab 会触发列表重渲染，必须等新列表出来再取号。
-        // 不等就会在页面已经空了的时候去拿，取回 0 条（曾经连续 11 次“取不到订单”的真因）。
-        if (clickedPending) await waitForOrders(controller, waitCap(deadline, 12_000))
-        else await delay(1500)
-      } catch { }
-      // 待收货筛选：全拿（最多 40 条保险）。没筛到就是全量列表（按时间倒序），
-      // 只取前 20 条——后面的都是几个月前的历史单，多拿只会多开网页、多撞风控。
+        if (clickedPending) await waitForOrders(controller, 12_000, ctx)
+        else await pause(1500, ctx)
+      } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
       const cap = clickedPending ? 40 : 20
       let stable = 0
       let emptyConfirmed = false
       for (let i = 0; i < 10 && stable < 3 && pcIds.length < cap; i++) {
-        if (deadlineReached(deadline)) break
-        const raw = String(await controller.evaluateJavaScript<string>(IDS_ONLY) || "")
+        if (deadlineReached(ctx.deadline)) break
+        throwIfStopped(ctx)
+        const raw = String(await evalPage<string>(controller, IDS_ONLY, 4_000, "读取PC订单号", ctx) || "")
         let info: any = {}
         try { info = JSON.parse(raw) } catch { }
         diag("taobao-ids", { cnt: info.cnt, a: info.a, len: info.len, t: info.t, emp: info.emp })
-        // 页面明确写了「没有找到相关订单」：这就是空态，立刻结束，不用等满 5 秒
         if (info.emp && pcIds.length === 0) { emptyConfirmed = true; break }
         const got = String(info.ids || "")
         const beforeN = pcIds.length
         for (const v of got.split(",")) if (v) pushPc(v)
         stable = pcIds.length === beforeN ? stable + 1 : 0
-        try { await controller.evaluateJavaScript("window.scrollTo(0, document.body.scrollHeight)") } catch { }
-        await delay(700)
+        try { await evalPage(controller, "return (function(){try{window.scrollTo(0, document.body.scrollHeight);return 1}catch(e){return 0}})()", 2_000, "滚动PC订单", ctx) } catch (e) {
+          if (isSupersededError(e) || isPageCapability(e)) throw e
+        }
+        await pause(700, ctx)
       }
-      // 页面明确告诉「没有订单」—— 这也是一种「就绪」，不是故障
       if (emptyConfirmed) pageOk = true
       try {
-        const reqs = String(await controller.evaluateJavaScript<string>(
-          "return JSON.stringify((window.__ppReq||[]).slice(-14))") || "[]")
-        diag("taobao-xhr", { reqs: JSON.parse(reqs) })
-      } catch { }
+        const reqs = String(await evalPage<string>(
+          controller,
+          "return JSON.stringify((window.__ppReq||[]).slice(-14))",
+          3_000,
+          "读取页面请求",
+          ctx,
+        ) || "[]")
+        const list = JSON.parse(reqs)
+        diag("taobao-xhr", { n: Array.isArray(list) ? list.length : 0 })
+      } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
     } catch (e: any) {
       if (isFatalTaobaoError(e)) throw e
     }
-    if (needLogin) throw new Error(formatAuthNeeded(await currentPageUrl(controller)))
-    if (pcIds.length > 0) { lastTaobaoPageOk = true; return pcIds }
+    if (needLogin) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
+    if (pcIds.length > 0) { markPage(ctx, true); return pcIds }
 
-    // 兜底：H5 订单列表（页面正常时仍可用）
-    if (deadlineReached(deadline)) {
-      if (pcIds.length > 0) { lastTaobaoPageOk = true; return pcIds }
-      throw new Error(formatStepTimeout("整轮时间预算用尽", 0, await currentPageUrl(controller)))
+    if (deadlineReached(ctx.deadline)) {
+      if (pcIds.length > 0) { markPage(ctx, true); return pcIds }
+      throw budgetError(ctx, await currentPageUrl(controller, ctx))
     }
-    await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "兜底加载H5订单页", deadline)
-    try { await controller.evaluateJavaScript(CLEAR_OVERLAYS) } catch { }
-    if (await atLoginPage(controller)) throw new Error(formatAuthNeeded(await currentPageUrl(controller)))
+    await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "兜底加载H5订单页", ctx)
+    try { await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx) } catch (e) {
+      if (isSupersededError(e) || isPageCapability(e)) throw e
+    }
+    if (await atLoginPage(controller, ctx)) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
 
     let blob = ""
     for (let i = 0; i < 15; i++) {
-      if (deadlineReached(deadline)) break
-      // 直接取整块 Ultron 数据。快递聚合3.0 就是这么拿的，实测能拿到 15 单，
-      // 之前我加的「超过 600KB 就不取」把这条唯一能用的线路直接挂死了。
-      blob = String(await controller.evaluateJavaScript<string>(
-        "return window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''"
+      if (deadlineReached(ctx.deadline)) break
+      throwIfStopped(ctx)
+      blob = String(await evalPage<string>(
+        controller,
+        "return window.currentUltronData ? JSON.stringify(window.currentUltronData) : ''",
+        4_000,
+        "读取兜底H5订单",
+        ctx,
       ) || "")
       if (blob.includes("bizOrderId")) break
-      // 列表是懒加载的，滚到底部催一下，再等一轮
-      try { await controller.evaluateJavaScript("window.scrollTo(0, document.body.scrollHeight)") } catch { }
-      await delay(600)
+      try { await evalPage(controller, "return (function(){try{window.scrollTo(0, document.body.scrollHeight);return 1}catch(e){return 0}})()", 2_000, "滚动兜底H5", ctx) } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
+      await pause(600, ctx)
     }
 
     const ids: string[] = []
     const push = (v: string) => { if (v && !ids.includes(v)) ids.push(v) }
     for (const m of blob.matchAll(/bizOrderId=(\d{10,})/g)) push(m[1])
-    // 「查看物流」按钮才带 bizOrderId；本身不需要物流的单只能靠 orderId 字段抽
     for (const m of blob.matchAll(/"orderId":"(\d{10,})"/g)) push(m[1])
-    // 兜底：Ultron 数据没拿到时，从 DOM 里找订单链接
     if (ids.length === 0) {
       try {
-        const raw = String(await controller.evaluateJavaScript<string>(IDS_ONLY) || "")
+        const raw = String(await evalPage<string>(controller, IDS_ONLY, 4_000, "读取兜底订单号", ctx) || "")
         let info: any = {}
         try { info = JSON.parse(raw) } catch { }
         for (const v of String(info.ids || "").split(",")) if (v) push(v)
-      } catch { }
+      } catch (e) {
+        if (isSupersededError(e) || isPageCapability(e)) throw e
+      }
     }
-    if (ids.length > 0 || pageOk) lastTaobaoPageOk = true
+    if (ids.length > 0 || pageOk) markPage(ctx, true)
     return ids
   } finally {
-    controller.dispose()
+    try { ctx.dispose?.() } catch { /* 发现订单结束就释放页面 */ }
   }
 }
 
 /* ---------------- 同步 ---------------- */
 
 /** 历史已签收的判定在 model.ts（isHistoricalPkg），三个平台共用 */
-export async function syncAll(onProgress?: (done: number, total: number) => void, deadline?: number, skipOrderIds?: Set<string>): Promise<Snapshot> {
+export async function syncAll(onProgress?: (done: number, total: number) => void, deadline?: number, skipOrderIds?: Set<string>, syncId: string | null = null): Promise<Snapshot> {
   if (!hasLogin()) throw new Error("请先登录淘宝")
-  beginTaobaoDiag()
-  const t0 = Date.now()
+  const diagId = beginTaobaoDiag()
+  const roundStart = Date.now()
+  const ctx: TaobaoRun = { diagId, syncId, roundStart, deadline }
   try {
-  if (deadlineReached(deadline)) throw new Error(formatStepTimeout("整轮时间预算用尽", 0))
-  const discovered = await discoverOrderIds(deadline)
-  recordTaobaoStep("发现订单", Date.now() - t0, true, undefined, `${discovered.length} 单`)
-  // 增量：已签收且近 3 天更新过的单不再重拉物流，状态不会变，省一轮往返
-  const ids = skipOrderIds ? discovered.filter(id => !skipOrderIds.has(id)) : discovered
-  // 注意：这句话里不能出现「登录/过期/风控/验证」——handleError 靠关键词判定登录失效，
-  // 页面没加载出来也会被误标成“登录已失效”（用户实测就是这个坑）。
-  if (ids.length === 0) {
-    // 页面正常但账号里确实没订单：这是一次成功的同步，不能报错
-    if (lastTaobaoPageOk) {
-      finishTaobaoDiag(true)
-      return { packages: [], syncedAt: Date.now() }
+    throwIfStopped(ctx)
+    if (deadlineReached(deadline)) throw budgetError(ctx)
+    const discovered = await discoverOrderIds(ctx)
+    recordTaobaoStep("发现订单", Date.now() - roundStart, true, undefined, `${discovered.length} 单`, diagId)
+    const ids = skipOrderIds ? discovered.filter(id => !skipOrderIds.has(id)) : discovered
+    if (ids.length === 0) {
+      if (lastTaobaoPageOk) {
+        finishTaobaoDiag(true, undefined, diagId)
+        return { packages: [], syncedAt: Date.now() }
+      }
+      throw new Error("淘宝订单页未就绪，本轮跳过")
     }
-    throw new Error("淘宝订单页未就绪，本轮跳过")
-  }
-  // 并发 4 路拉物流：单路串行时 10 单要 10 个往返，用户体感就是“同步好久”
-  const packages: Pkg[] = []
-  let next = 0
-  let done = 0
-  const worker = async () => {
-    while (next < ids.length) {
-      if (deadline && Date.now() > deadline) return
-      const i = next++
-      let pkg: Pkg | null = null
-      try { pkg = await fetchPackage(ids[i]) } catch { pkg = null }
-      if (pkg && !isHistoricalPkg(pkg)) packages.push(pkg)
-      done++
-      onProgress?.(done, ids.length)
+    const packages: Pkg[] = []
+    let next = 0
+    let done = 0
+    let blocked: unknown = null
+    const worker = async () => {
+      try {
+        while (next < ids.length && !blocked) {
+          if (deadlineReached(deadline)) return
+          throwIfStopped(ctx)
+          const i = next++
+          let pkg: Pkg | null = null
+          try { pkg = await fetchPackage(ids[i], undefined, { diagId }) } catch (e) {
+            if (isSupersededError(e) || isTimerUnavailable(e) || isPageCapability(e)) {
+              blocked = e
+              return
+            }
+            pkg = null
+          }
+          if (pkg && !isHistoricalPkg(pkg)) packages.push(pkg)
+          done++
+          onProgress?.(done, ids.length)
+        }
+      } catch (e) {
+        blocked = blocked ?? e
+      }
     }
-  }
-  // 并发 6 路拉物流（原 4 路）：单个运单一次跳转约 0.3～1 秒，6 路同时跑能把 20 单拉到 4～5 秒
-  const t1 = Date.now()
-  await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()])
-  recordTaobaoStep("拉物流", Date.now() - t1, true, undefined, `${packages.length}/${ids.length}`)
-  const snapshot: Snapshot = { packages, syncedAt: Date.now() }
-  finishTaobaoDiag(true)
-  return snapshot
+    const t1 = Date.now()
+    await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()])
+    if (isSupersededError(blocked) || (ctx.syncId != null && !runIsCurrent(ctx.syncId))) throw new SyncSuperseded()
+    if (packages.length === 0 && blocked) throw blocked
+    recordTaobaoStep("拉物流", Date.now() - t1, true, undefined, `${packages.length}/${ids.length}`, diagId)
+    const snapshot: Snapshot = { packages, syncedAt: Date.now() }
+    finishTaobaoDiag(true, undefined, diagId)
+    return snapshot
   } catch (e: any) {
-    finishTaobaoDiag(false, String(e?.message ?? e))
+    if (isSupersededError(e)) abandonTaobaoDiag(diagId)
+    else finishTaobaoDiag(false, String(e?.message ?? e), diagId)
     throw e
   }
 }
-

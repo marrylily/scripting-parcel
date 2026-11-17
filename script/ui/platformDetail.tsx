@@ -17,6 +17,9 @@ import { PddMobileSection } from "./pddMobiles"
 import { MiPhoneSection } from "./miPhones"
 import { fcMobile } from "../utils/fengchao"
 
+/** 详情页上新的一次同步取代上一次，旧调用不能把「同步中」清掉。 */
+let detailSyncEpoch = 0
+
 function hmText(t: number): string {
   const d = new Date(t)
   const p = (n: number) => String(n).padStart(2, "0")
@@ -46,26 +49,31 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
   /* ---- 各平台专属设置都是内嵌 Section 组件，避免多开一层页面 ---- */
 
   async function doSync() {
-    if (busy) return
+    const epoch = ++detailSyncEpoch
     setBusy(true)
     setSyncText("准备中…")
     try {
       clearPlatformLastError(id)
-      setRev(r => r + 1)
+      if (epoch === detailSyncEpoch) setRev(r => r + 1)
       // 只认平台结论（与授权页、通知同一份），不再拿平台名字去 errors 里模糊匹配：
       // 「小米快递聚合」与「小米快递」对不上，就会把真实原因吐成「同步未完成」。
-      const report = await syncPlatformParcels((t) => setSyncText(t || "同步中…"),
-        { force: true, quietIssues: true, deadline: Date.now() + MANUAL_SYNC_MS, only: [id] })
+      const report = await syncPlatformParcels((t) => {
+        if (epoch === detailSyncEpoch) setSyncText(t || "同步中…")
+      }, { force: true, preempt: true, quietIssues: true, deadline: Date.now() + MANUAL_SYNC_MS, only: [id] })
+      if (epoch !== detailSyncEpoch) return
       const res = report?.results?.[id]
       if (res?.outcome === "ok") notify(`${name}已同步`)
-      else if (!res) notify(`${name}未启用，请先授权或打开开关`, "warn")
-      else notify(sanitizeSyncMessage(String(res.message || "未完成"), 80), res.outcome === "failed" ? "warn" : "info")
+      else if (!res && !report?.busy) notify(`${name}未启用，请先授权或打开开关`, "warn")
+      else if (res) notify(sanitizeSyncMessage(String(res.message || "未完成"), 80), res.outcome === "failed" ? "warn" : "info")
     } catch (e: any) {
+      if (epoch !== detailSyncEpoch) return
       notify(sanitizeSyncMessage(String(e?.message ?? e), 80) || "同步失败", "error")
     } finally {
-      setBusy(false)
-      setSyncText("")
-      setRev(r => r + 1)
+      if (epoch === detailSyncEpoch) {
+        setBusy(false)
+        setSyncText("")
+        setRev(r => r + 1)
+      }
     }
   }
 

@@ -61,11 +61,15 @@ export function pageUrlOf(raw: string): string {
   }
 }
 
-/** 超时文案：步骤名 + 耗时 + 当前页（仅 host+path）。 */
+/** 超时文案：步骤名 + 耗时 + 当前页（仅 host+path）。耗时用真实经过的毫秒，不要写死 0。 */
 export function formatStepTimeout(step: string, elapsedMs: number, pageUrl?: string): string {
   const sec = (Math.max(0, Number(elapsedMs) || 0) / 1000).toFixed(1)
   const loc = pageUrl ? ` ${pageUrlOf(pageUrl)}` : ""
   return `淘宝·${step}超时 ${sec}s${loc}`
+}
+
+export function formatBudgetExhausted(elapsedMs: number, pageUrl?: string): string {
+  return formatStepTimeout("整轮时间预算用尽", elapsedMs, pageUrl)
 }
 
 export function formatAuthNeeded(pageUrl?: string): string {

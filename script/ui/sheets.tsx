@@ -735,6 +735,8 @@ function AddLocationPage({ close, bump }: { close: Closer; bump: Closer }) {
 }
 
 // ---------------- 账号授权 ----------------
+/** 同一页上新的一次手动同步会取代上一次；旧调用的 finally 不能把新按钮收回。 */
+let manualSyncEpoch = 0
 function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; open: Opener }) {
   const [busy, setBusy] = useState<PlatformId | null>(null)
   const [rev, setRev] = useState(0)
@@ -752,30 +754,34 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
   }, [])
 
   async function runSync(only?: string[]) {
-    if (syncing) return
+    const epoch = ++manualSyncEpoch
     setSyncing(true)
     setSyncErr("")
     setSyncText("准备中…")
     try {
       clearPlatformLastError(only && only.length ? only : PLATFORMS.map(p => p.id))
-      setRev(r => r + 1)
-      // 120 秒是传给内部的协作式 deadline（循环里看 Date.now()），不是硬超时。
-      // 不要再用 setTimeout / Promise.race 包一层：原包已说明 Timer 会在非主脚本队列报错。
+      if (epoch === manualSyncEpoch) setRev(r => r + 1)
+      // 预算仍是 MANUAL_SYNC_MS。页面加载用 WebView 官方超时，结束后这里一定会收回按钮。
       // only：授权完某平台后只同步它，不连累其它平台
-      const report = await syncPlatformParcels((t) => setSyncText(t || "同步中…"), { force: true, deadline: Date.now() + MANUAL_SYNC_MS, only })
+      const report = await syncPlatformParcels((t) => {
+        if (epoch === manualSyncEpoch) setSyncText(t || "同步中…")
+      }, { force: true, preempt: true, deadline: Date.now() + MANUAL_SYNC_MS, only })
+      if (epoch !== manualSyncEpoch) return
       bump()
       setRev(r => r + 1)
       // 单平台失败时 syncPlatformParcels 不会抛错，必须把结论写到按钮右侧，避免仍显示「尚未同步」且没有任何错误。
       const summary = summarizeReport((report as any)?.results)
       if (summary) setSyncErr(summary)
     } catch (e: any) {
+      if (epoch !== manualSyncEpoch) return
       // 错误写在行右侧，不再弹气泡（避免和行内文案重复）
       setSyncErr(sanitizeSyncMessage(String(e?.message ?? e), 48) || "同步失败")
     } finally {
-      // 仅在 syncPlatformParcels 的 Promise 结束后收回按钮；挂住时不会仅凭 finally 结束。
-      setSyncing(false)
-      setSyncText("")
-      setRev(r => r + 1)
+      if (epoch === manualSyncEpoch) {
+        setSyncing(false)
+        setSyncText("")
+        setRev(r => r + 1)
+      }
     }
   }
 
@@ -921,7 +927,7 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
         })}
       </Section>
 
-      <Section title="同步" footer="打开 App 会按「刷新频率」里的间隔自动拉；手动同步无视间隔，用 120 秒预算把所有平台翻一遍（含京东）。">
+      <Section title="同步" footer="打开 App 会按「刷新频率」里的间隔自动拉；手动同步无视间隔，用约 3 分钟预算把所有平台翻一遍（含京东）。页面卡住会按步骤超时返回，按钮会收回。">
         <Button buttonStyle="plain" disabled={syncing} frame={{ maxWidth: "infinity", alignment: "leading" }} contentShape="rect"
           action={() => void runSync()}>
           <HStack spacing={12} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
@@ -1673,7 +1679,7 @@ function routeInner(k: string, p: any, ctx: { close: Closer; bump: Closer; open:
   if (k === "qrLogin") return <QrLoginPage close={close} bump={bump} />
   if (k === "authorize") return <AuthorizePage close={close} bump={bump} open={open} />
   if (k === "fengchaoLogin") return <FengchaoLoginPage close={close} bump={bump}
-    onDone={() => void syncPlatformParcels(undefined, { only: ["fengchao"], force: true }).catch(() => { })} />
+    onDone={() => void syncPlatformParcels(undefined, { only: ["fengchao"], force: true, preempt: true }).catch(() => { })} />
   if (k === "miLogin") return <MiLoginPage close={close} bump={bump} />
   // pddMobiles 已并入平台详情页（PddMobileSection），旧路由删掉
   if (k === "nickname") return <NicknamePage close={close} bump={bump} />

@@ -167,8 +167,8 @@ async function runPlatformSync(state: TaskState, rotateMin: number, snap: any, b
       ran = Array.isArray(report?.ran) && report.ran.includes(target)
       if (outcome === "ok") {
         delete fail[target]
-      } else if (outcome === "skipped") {
-        // 无 WebView / 时间不够是跳过，不是失败：不要记连败，否则淘宝会在组件里被关 6 小时。
+      } else if (outcome === "skipped" || report?.busy) {
+        // 无 WebView / 时间不够 / 已有一轮同步是跳过，不是失败：不要记连败，否则淘宝会在组件里被关 6 小时。
         delete fail[target]
         ran = false
       } else {
