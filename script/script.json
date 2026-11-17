@@ -1,0 +1,30 @@
+{
+  "description": "ParcelPal 1.2.3 remote-update edition, based on the 1.2.2 diagnostic fix. Adds Scripting remoteResource; auth and keys unchanged.",
+  "remoteDefinitionId": null,
+  "name": "包裹助手（远程更新）",
+  "iconImage": null,
+  "author": null,
+  "intentInputTypes": [
+    "texts",
+    "images"
+  ],
+  "permissions": null,
+  "entry": "index.tsx",
+  "icon": "shippingbox.fill",
+  "color": "rgba(124, 76, 179,1)",
+  "version": "1.2.3",
+  "contributors": [],
+  "runInApp": false,
+  "remoteResource": {
+    "url": "https://github.com/marrylily/scripting-parcel/tree/main/script",
+    "autoUpdateInterval": 3600
+  },
+  "localizedDescriptions": {
+    "zh": "1.2.3 远程更新版：在 1.2.2 诊断修复（脱敏错误可见、手动同步菜鸟先行、无新增硬超时计时器）基础上，加入 Scripting 远程来源，便于之后从 GitHub 更新。登录与密钥逻辑未改。",
+    "en": "1.2.3 remote-update edition of the 1.2.2 diagnostic build. Adds a Scripting remote source. Auth and keys unchanged."
+  },
+  "localizedNames": {
+    "en": "ParcelPal (remote updates)",
+    "zh": "包裹助手（远程更新）"
+  }
+}
