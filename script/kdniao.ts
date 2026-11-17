@@ -23,6 +23,7 @@ import { notifyArrived } from "./utils/reminders"
 import { arrivedAtOf } from "./utils/arrive"
 import { refreshPlatformParcels } from "./platforms"
 import { notify } from "./ui/notify"
+import { safeDelay } from "./utils/safeTimer"
 
 declare const fetch: any
 
@@ -326,7 +327,7 @@ export async function refreshTokenFromWebView(): Promise<string> {
   const wv = new WebViewController()
   try {
     await wv.loadURL(BIZ_LOGIN_URL)
-    await new Promise<void>(r => setTimeout(() => r(), 3000))
+    await safeDelay(3000)
     const raw = String(await wv.evaluateJavaScript("return localStorage.getItem('app-sso') || ''") ?? "")
     let token = ""
     try { token = JSON.parse(raw || "{}")?.state?.accessToken || "" } catch { }

@@ -14,7 +14,8 @@ import { TrackDetailPage, TrackSearchSheet } from "./trackSearch"
 import { KdniaoLoginPage } from "./kdLogin"
 import { clearCredential, clearToken, loadCredential, loadUser, refreshUser } from "../kdniao"
 import { authorize, clearAuth, hasAuth, markPlatform, needsReauth, platformEnabled, PLATFORMS, syncPlatformParcels, type PlatformId } from "../platforms"
-import { readFullSyncAt, platformLastSyncedAt, platformLastError, miPhones } from "../utils/platformSync"
+import { readFullSyncAt, platformLastSyncedAt, platformLastError, miPhones, clearPlatformLastError } from "../utils/platformSync"
+import { safeDelay } from "../utils/safeTimer"
 import { MANUAL_SYNC_MS, sanitizeSyncMessage, summarizeReport } from "../utils/syncSafety"
 import { notify } from "./notify"
 import { FengchaoLoginPage } from "./fengchaoLogin"
@@ -756,6 +757,8 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
     setSyncErr("")
     setSyncText("准备中…")
     try {
+      clearPlatformLastError(only && only.length ? only : PLATFORMS.map(p => p.id))
+      setRev(r => r + 1)
       // 120 秒是传给内部的协作式 deadline（循环里看 Date.now()），不是硬超时。
       // 不要再用 setTimeout / Promise.race 包一层：原包已说明 Timer 会在非主脚本队列报错。
       // only：授权完某平台后只同步它，不连累其它平台
@@ -850,7 +853,7 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
                         const deadline = Date.now() + 10 * 60 * 1000
                         let ok = false
                         while (presented && Date.now() < deadline) {
-                          await new Promise<void>(r => (setTimeout as any)(r, 2000))
+                          await safeDelay(2000)
                           if (!presented) break
                           const cur = String((controller as any).url || "")
                           const done = cur.includes("fe/service/account")
@@ -881,7 +884,7 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
                             }
                           }
                         }
-                        if (presented) { try { controller.dismiss() } catch { } await new Promise<void>(r => (setTimeout as any)(r, 400)) }
+                        if (presented) { try { controller.dismiss() } catch { } await safeDelay(400) }
                         if (ok && miHasLogin()) {
                           markPlatform("mi", true)
                           notify("小米账号登录成功")

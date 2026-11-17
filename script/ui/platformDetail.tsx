@@ -10,7 +10,7 @@ import {
   PLATFORMS, authorize, clearAuth, hasAuth, markPlatform, needsReauth,
   platformEnabled, platformState, setPlatformEnabled, type PlatformId,
 } from "../platforms"
-import { miPhones, platformLastError, platformLastSyncedAt, syncPlatformParcels } from "../utils/platformSync"
+import { miPhones, platformLastError, platformLastSyncedAt, syncPlatformParcels, clearPlatformLastError } from "../utils/platformSync"
 import { sanitizeSyncMessage } from "../utils/syncSafety"
 import { PddMobileSection } from "./pddMobiles"
 import { MiPhoneSection } from "./miPhones"
@@ -49,6 +49,8 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
     setBusy(true)
     setSyncText("准备中…")
     try {
+      clearPlatformLastError(id)
+      setRev(r => r + 1)
       // 只认平台结论（与授权页、通知同一份），不再拿平台名字去 errors 里模糊匹配：
       // 「小米快递聚合」与「小米快递」对不上，就会把真实原因吐成「同步未完成」。
       const report = await syncPlatformParcels((t) => setSyncText(t || "同步中…"),

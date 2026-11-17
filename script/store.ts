@@ -4,6 +4,7 @@ import { companyName } from "./theme"
 import { syncLogosToShared } from "./utils/widgetLogos"
 import { matchStationIn as matchStationInPure } from "./utils/stationMatch"
 import { readJsonFile, writeJsonFile, operationFiles } from "./utils/sharedJson"
+import { tryScheduleTimeout } from "./utils/safeTimer"
 // 数据模型字段与原 Pickup 一一对应（取件码/公司/地址/手机号/备注/状态/短信/驿站）。
 // 数据只存本机 Storage，不访问任何自建服务器。
 
@@ -544,13 +545,17 @@ export function setPickupStatus(uuid: string, status: PickupStatus) {
 }
 
 /** 取件页/小组件改完状态都要让对面立刻重画，保证两边永远同源同结果 */
-let widgetSyncTimer: ReturnType<typeof setTimeout> | null = null
+let widgetSyncTimer: any = null
 function syncWidget(delay = 600) {
   if (widgetSyncTimer) return
-  widgetSyncTimer = setTimeout(() => {
+  const { id, scheduled } = tryScheduleTimeout(() => {
     widgetSyncTimer = null
     try { Widget.reloadAll() } catch { }
   }, delay)
+  if (scheduled) widgetSyncTimer = id
+  else {
+    try { Widget.reloadAll() } catch { }
+  }
 }
 
 // ---------- 驿站 ----------
