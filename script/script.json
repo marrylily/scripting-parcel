@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.3 remote-update edition, based on the 1.2.2 diagnostic fix. Adds Scripting remoteResource; auth and keys unchanged.",
+  "description": "ParcelPal 1.2.4 remote-update edition. Wraps Scripting timers so WebView/background callbacks do not surface “Timer requires its active script on the main”; stamps sync failures with version and time; clears stale App Group failure records at sync start. Auth and keys unchanged.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.3 远程更新版：在 1.2.2 诊断修复（脱敏错误可见、手动同步菜鸟先行、无新增硬超时计时器）基础上，加入 Scripting 远程来源，便于之后从 GitHub 更新。登录与密钥逻辑未改。",
-    "en": "1.2.3 remote-update edition of the 1.2.2 diagnostic build. Adds a Scripting remote source. Auth and keys unchanged."
+    "zh": "1.2.4 远程更新版：安全包装会触发「Timer requires its active script on the main」的计时器；同步开始时清除旧失败记录，新失败带版本号和时间。登录与密钥逻辑未改。",
+    "en": "1.2.4 remote-update edition. Safely wraps Scripting timers that can throw “Timer requires its active script on the main”; clears stale failure records at sync start and stamps new failures with version and time. Auth and keys unchanged."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",

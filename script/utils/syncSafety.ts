@@ -1,3 +1,4 @@
+import { APP_VERSION } from "./version"
 /**
  * 同步辅助：手动同步顺序、脱敏结论文案、预算判断。
  * 不要在这里用 setTimeout 做 Promise 超时竞速。
@@ -5,8 +6,19 @@
  * “Timer requires its active script on the main JS execution queue”。
  */
 
+export { APP_VERSION }
+
 export const MANUAL_SYNC_MS = 120_000
 export const HUMAN_VERIFY_MIN_MS = 15_000
+
+/** 失败文案带版本和时间，便于区分旧版残留与本轮新失败。 */
+export function tagSyncError(msg: string, at = Date.now()): string {
+  const d = new Date(at)
+  const p = (n: number) => String(n).padStart(2, "0")
+  const stamp = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  const body = String(msg ?? "").replace(/\s+/g, " ").trim() || "同步失败"
+  return `${APP_VERSION} ${stamp}：${body}`
+}
 
 export function remainingMs(deadline: number, now = Date.now()): number {
   if (!Number.isFinite(deadline)) return Number.POSITIVE_INFINITY
