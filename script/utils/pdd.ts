@@ -1,5 +1,6 @@
 import { classify, closedOrderStatus, Pkg, statusFromCode, timeOfTrack } from "./model"
 import { etaInObject, etaInText, etaTimeInText } from "./eta"
+import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 export const PDD_COOKIE_KEY = "pdd.cookies"
 const PDD_LS_KEY = "pdd.localStorage"
@@ -17,7 +18,7 @@ const LOGIN_URL = "https://mobile.yangkeduo.com/login.html"
 const ORDERS_URL = "https://mobile.yangkeduo.com/orders.html"
 
 declare const fetch: any
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
+const delay = (ms: number) => safeDelay(ms)
 
 /* ---------------- 登录态 ---------------- */
 
@@ -449,7 +450,7 @@ async function fetchRaw(url: string): Promise<string> {
 
 /** 给可能卡住的 WebView 调用加超时：物流页地图瓦片会持续请求，waitForLoad 可能永远等不到 */
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return Promise.race([p, delay(ms).then(() => fallback) as unknown as Promise<T>])
+  return safeTimeoutRace(p, ms, "页面超时").catch(() => fallback)
 }
 
 /** 打开页面并同时拿回：渲染后文本 / 所有 order_sn 链接 / rawData */

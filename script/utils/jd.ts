@@ -2,6 +2,7 @@ import { classify, closedOrderStatus, Pkg, timeOfTrack } from "./model"
 import { normalizePickupCode } from "./codes"
 import { etaInText, etaTimeInText } from "./eta"
 import { diag } from "./net"
+import { safeDelay, pageTimeout } from "./safeTimer"
 
 export const JD_COOKIE_KEY = "jd.cookies"
 
@@ -10,13 +11,7 @@ const SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleW
 
 const LOGIN_URL = "https://plogin.m.jd.com/login/login?appid=0&returnurl=https%3A%2F%2Fhome.m.jd.com%2FmyJd%2Fnewhome.action"
 
-/** 页面加载加超时：京东页会挂很久不报错，不设超时会把整轮同步拖死 */
-function pageTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = (setTimeout as any)(() => reject(new Error("页面超时")), ms)
-    p.then(v => { clearTimeout(t); resolve(v) }, e => { clearTimeout(t); reject(e) })
-  })
-}
+/** 页面加载加超时：实现见 safeTimer（Timer 不可用时不加硬超时，避免抛队列错误） */
 // 京东订单中心首页（my_order_entrance 里点「全部订单」进入全量列表）；
 // 订单列表页 URL 自带 state 参数可直达「待收货」，但拦截判定依赖首页入口元素，保留首页入口再点全部
 const MY_URL = "https://my.m.jd.com/index.html?sceneval=2"
@@ -51,7 +46,7 @@ const JD_LOGIN_FIX = `(function(){
 })()`
 
 declare const fetch: any
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
+const delay = (ms: number) => safeDelay(ms)
 
 /* ---------------- 登录态 ---------------- */
 
