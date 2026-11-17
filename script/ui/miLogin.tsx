@@ -10,6 +10,7 @@ import { SubPage, Section } from "./kit"
 declare const fetch: any
 import { notify } from "./notify"
 import { miHasLogin, miMintToken, miReadUser, miSaveSession } from "../utils/mi"
+import { tryScheduleTimeout, safeClearTimeout, safeDelay } from "../utils/safeTimer"
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -47,7 +48,7 @@ export function MiLoginPage({ close, bump }: { close: () => void; bump?: () => v
                 const deadline = Date.now() + 10 * 60 * 1000
                 let ok = false
                 while (presented && Date.now() < deadline) {
-                  await new Promise<void>(r => (setTimeout as any)(r, 2000))
+                  await safeDelay(2000)
                   if (!presented) break
                   const cur = String((controller as any).url || "")
                   // 原版 tryLogin 触发条件：登录完成页 / account 页 / STS 跳转
@@ -84,7 +85,7 @@ export function MiLoginPage({ close, bump }: { close: () => void; bump?: () => v
                     }
                   }
                 }
-                if (presented) { try { controller.dismiss() } catch { } await new Promise<void>(r => (setTimeout as any)(r, 400)) }
+                if (presented) { try { controller.dismiss() } catch { } await safeDelay(400) }
                 if (ok && miHasLogin()) {
                   notify("小米账号登录成功", "info")
                   bump?.()
