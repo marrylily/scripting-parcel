@@ -160,17 +160,26 @@ async function runPlatformSync(state: TaskState, rotateMin: number, snap: any, b
     let ran = false
     try {
       const report = await syncPlatformParcels(undefined, {
-        // force: 外层已经用 platformLast 判过「欠账」了，内部的 3 小时闸门会把它又挡回去，
-        // 导致组件的全量永远空转（App 每 3h 跑一遍正好把闸门填满）。
+        // force: 外层已经用 platformLast 判过「欠账」了，内部的间隔闸门不能再把它挡回去。
         only: [target], deadline: Date.now() + budget, silent: true, quietIssues: true, force: true,
       })
+      const outcome = report?.results?.[target]?.outcome
       ran = Array.isArray(report?.ran) && report.ran.includes(target)
-    } catch { ran = false }
-    if (ran) {
-      delete fail[target]
-    } else {
+      if (outcome === "ok") {
+        delete fail[target]
+      } else if (outcome === "skipped") {
+        // 无 WebView / 时间不够是跳过，不是失败：不要记连败，否则淘宝会在组件里被关 6 小时。
+        delete fail[target]
+        ran = false
+      } else {
+        ran = false
+        const n = (fail[target]?.n ?? 0) + 1
+        const backoff = n >= 3 ? 6 * 3_600_000 : Math.min(6 * 3_600_000, coolMs * n)
+        fail[target] = { n, until: Date.now() + backoff }
+      }
+    } catch {
+      ran = false
       const n = (fail[target]?.n ?? 0) + 1
-      // 连败 3 次就停 6 小时（交回 App），避免一个坏平台把每次唤醒都拖住
       const backoff = n >= 3 ? 6 * 3_600_000 : Math.min(6 * 3_600_000, coolMs * n)
       fail[target] = { n, until: Date.now() + backoff }
     }

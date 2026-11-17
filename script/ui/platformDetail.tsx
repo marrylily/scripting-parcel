@@ -10,7 +10,7 @@ import {
   PLATFORMS, authorize, clearAuth, hasAuth, markPlatform, needsReauth,
   platformEnabled, platformState, setPlatformEnabled, type PlatformId,
 } from "../platforms"
-import { miPhones, platformLastError, platformLastSyncedAt, syncPlatformParcels, clearPlatformLastError } from "../utils/platformSync"
+import { miPhones, platformLastSyncedAt, syncPlatformParcels, clearPlatformLastError, platformSyncHint } from "../utils/platformSync"
 import { sanitizeSyncMessage } from "../utils/syncSafety"
 import { PddMobileSection } from "./pddMobiles"
 import { MiPhoneSection } from "./miPhones"
@@ -39,7 +39,7 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
   const expired = needsReauth(id)
   const st = platformState(id)
   const lastAt = platformLastSyncedAt(id)
-  const err = platformLastError(id)
+  const hint = platformSyncHint(id)
   const name = p?.name ?? id
 
   /* ---- 各平台专属设置都是内嵌 Section 组件，避免多开一层页面 ---- */
@@ -154,7 +154,7 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
       ) : null}
 
       <Section title="同步"
-        footer={err && Date.now() - err.at < 3 * 3_600_000 ? `最近一次失败：${err.msg}` : undefined}>
+        footer={hint ? `${hint.kind === "error" ? "最近一次失败" : "最近一次跳过"}：${hint.msg}` : undefined}>
         <HStack spacing={12} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
           <Icon name="clock.arrow.circlepath" size={18} color={C.accent} />
           <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" }}>

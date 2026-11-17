@@ -12,7 +12,7 @@ import { TrackSearchSheet, TrackDetailPage } from "./trackSearch"
 import { syncPickupActivity } from "./live"
 import { refreshTrackedPackages } from "../kdniao"
 import { warmCourierIcons } from "../utils/notifyIcon"
-import { refreshAll } from "../utils/refresh"
+import { refreshAll, refreshNow } from "../utils/refresh"
 import { syncLocationReminders } from "../utils/geo"
 import { dedupePickups } from "../utils/dedupe"
 import { applyPickupCodes } from "../utils/cainiao"
@@ -153,7 +153,7 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
   useEffect(() => { syncPickupActivity() }, [revision])
   // 物流包裹刷新（内部限频 5 分钟；顺带重排提醒与更新灵动岛）
   useEffect(() => {
-    void refreshAll("app").then(r => { if (r.changed > 0) setRevision(x => x + 1) })
+    void refreshAll("app").then(r => { if (r.changed > 0 || r.fetched) setRevision(x => x + 1) })
     // 通知图标预热：顺丰这类只有白色 logo 的公司，要在 App 里先把深色底版本渲染成 PNG 落盘，
     // 否则小组件后台发通知时渲染不了，只能退回白图标。
     void warmCourierIcons(getPickups().map(p => p.companyName)).catch(() => { })
@@ -174,7 +174,8 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
       .then(n => { if (n > 0) setRevision(x => x + 1) })
       .catch(() => { })
   }, [])
-  // 平台订单：每 3 小时全量同步一次（由 refreshAll → maybeFullSync 统一处理，小组件刷新也会跑）
+  // 平台订单：打开 App 时 maybeFullSync 按前台间隔补到期平台（淘宝要 WebView，只能在前台发现新单）
+  const pullRefresh = async () => { try { await refreshNow() } finally { bump() } }
   const closeSheet = () => setSheet({ kind: "none" })
   const openSheet = (kind: string, props?: any) => { setSheetNonce(n => n + 1); setSheet({ kind, props }) }
   const closeRoute = () => setRoute(r => {
@@ -192,6 +193,7 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
 
   const pickupPage = (
     <PickupTab revision={revision}
+      onRefresh={pullRefresh}
       onAdd={() => openSheet("trackSearch")}
       onEdit={(p: Pickup) => { setSheetNonce(n => n + 1); setSheet({ kind: "trackDetail", props: { uuid: p.uuid } }) }}
       onIdentityCode={(id: any) => open("identityCode", { id })}
@@ -209,6 +211,7 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
   }
   const parcelsPage = (
     <ParcelsTab revision={revision}
+      onRefresh={pullRefresh}
       onAdd={() => openSheet("trackSearch")}
       onEdit={editPickup}
       onExit={exitScript}

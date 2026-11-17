@@ -14,7 +14,7 @@ import { TrackDetailPage, TrackSearchSheet } from "./trackSearch"
 import { KdniaoLoginPage } from "./kdLogin"
 import { clearCredential, clearToken, loadCredential, loadUser, refreshUser } from "../kdniao"
 import { authorize, clearAuth, hasAuth, markPlatform, needsReauth, platformEnabled, PLATFORMS, syncPlatformParcels, type PlatformId } from "../platforms"
-import { readFullSyncAt, platformLastSyncedAt, platformLastError, miPhones, clearPlatformLastError } from "../utils/platformSync"
+import { readFullSyncAt, platformLastSyncedAt, platformLastError, miPhones, clearPlatformLastError, platformSyncHint } from "../utils/platformSync"
 import { safeDelay } from "../utils/safeTimer"
 import { MANUAL_SYNC_MS, sanitizeSyncMessage, summarizeReport } from "../utils/syncSafety"
 import { notify } from "./notify"
@@ -75,7 +75,7 @@ export function FaqPage({ close }: { close: Closer }) {
       items: [
         ["某个平台同步失败怎么办？", "打开「设置 → 账号授权 → 该平台」，失败原因写在那一页：未登录、需要在页面里验证、请求过多被限制、未绑定取件手机号，和别处看到的是同一句话。"],
         ["为什么淘宝、京东、拼多多要在 App 里才能同步？", "它们靠内嵌网页拿订单与物流，必须有界面。桌面组件也会按「全量轮转」逐个平台查新订单，但每次唤醒只能跑一小段（预算 3 秒、一次最多两个平台）；App 打开时会一次翻完，更快。"],
-        ["多久同步一次？", "间隔在「设置 → 刷新频率」里改：前台刷新、组件刷新、全量发现新订单、失败冷却四项。手动下拉随时可以拉。"],
+        ["多久同步一次？", "间隔在「设置 → 刷新频率」里改：前台刷新、组件刷新、全量发现新订单、失败冷却四项。打开 App 或手动下拉会让淘宝等网页平台也参与同步；点「立即同步」不受间隔限制。"],
         ["已签收或已退款的包裹为什么不见了？", "已签收超过 7 天的不再导入；退款、取消、退货是终态，卡片上会直接写「已退款」。"],
         ["淘宝和菜鸟要分别授权吗？", "共用一次淘宝登录：解除其中一个，那一项就显示未授权、不再读它的数据；两个都解除才清掉登录，下次要重新登。"],
       ],
@@ -813,10 +813,10 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
                     if (!authed) return "未授权"
                     // 配置缺失不必等同步失败才报：这就是它在详情页里的失败原因
                     if (p.id === "mi" && miPhones().length === 0) return "已授权 · 未绑定取件手机号"
-                    const err = platformLastError(p.id)
                     const last = platformLastSyncedAt(p.id)
-                    const fresh = err && Date.now() - err.at < 3 * 3_600_000
-                    if (fresh) return `已授权 · 同步失败：${err!.msg.slice(0, 30)}`
+                    const hint = platformSyncHint(p.id)
+                    if (hint?.kind === "error") return `已授权 · 同步失败：${hint.msg.slice(0, 30)}`
+                    if (hint?.kind === "skip") return `已授权 · 已跳过：${hint.msg.slice(0, 30)}`
                     if (last > 0) return `已授权 · 上次同步 ${hmText(last)}`
                     return "已授权"
                   })()}
