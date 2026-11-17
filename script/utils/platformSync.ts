@@ -23,7 +23,8 @@ import { miHasLogin, miFetchList, miFetchDetail, parseMiTraces, type MiExpressIt
 import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, trackMailNo as cnTrackMailNo } from "./cainiao"
 import { notify } from "../ui/notify"
 import { warningIconData } from "./notifyIcon"
-import { orderForManualSync, shouldStartHumanVerify } from "./syncSafety"
+import { orderForManualSync, shouldStartHumanVerify, tagSyncError } from "./syncSafety"
+import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 type Source = "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
 
@@ -36,7 +37,7 @@ export function platformCapability(): { taobao: boolean; jd: boolean; pdd: boole
   return { taobao: wv, jd: wv, pdd: wv }
 }
 
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
+const delay = (ms: number) => safeDelay(ms)
 
 function nowText(): string {
   const d = new Date()
@@ -391,7 +392,7 @@ async function handleError(id: PlatformId, e: any, report: PlatformSyncReport, a
   const raw = String(e?.message ?? e)
   const authLike = AUTH_RE.test(raw)
   const name = PLAT_LABEL[id] ?? "该平台"
-  const human = platformErrorText(raw)
+  const human = tagSyncError(platformErrorText(raw))
   setResult(report, id, "failed", human)
   // 失败原因写进共享日志；并记连续失败计数（同一平台连败 3 次 → 气泡+系统通知）
   let failStreak = 0
@@ -512,10 +513,7 @@ function clearFailStreak(id: PlatformId) {
 
 /** 给单条刷新加超时：网页卡住时不把整轮同步拖死（组件里 18 秒预算很紧） */
 function timeoutWrap<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = (setTimeout as any)(() => reject(new Error(`${what}超时`)), ms)
-    p.then(v => { clearTimeout(t); resolve(v) }, e => { clearTimeout(t); reject(e) })
-  })
+  return safeTimeoutRace(p, ms, `${what}超时`)
 }
 
 /** 刷新单条平台包裹；返回是否真的变了 */
@@ -711,6 +709,8 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   const succeededAt = readPlatformLast()
   // 手动全量让菜鸟先跑：它不依赖 WebView。自动/组件同步仍轮换。
   const ordered = opts?.force ? orderForManualSync(ids) : rotateOrder(ids)
+  // 本轮即将同步的平台先清旧失败，再写本轮结果（带版本和时间）
+  if (opts?.force && ordered.length) clearPlatformLastError(ordered)
   for (const id of ordered) {
     // 3 小时内成功过就不重拉：App 和组件共用一个时间戳，谁跑过另一边就跳过
     // force=true（用户点「立即同步」）时无视闸门，否则手动同步会被刚跑过的组件卡住。
@@ -1060,8 +1060,26 @@ export function platformLastError(id: string): { at: number; msg: string } | nul
   const v = readJsonFile(`${FileManager.appGroupDocumentsDirectory}/cc/syncErr.json`)
   const e = v?.[id]
   if (!e) return null
-  // 旧数据里 msg 存的是原始报错，读的时候也过一遍归一（对已归一的文案是幂等的）
-  return { at: Number(e.at) || 0, msg: platformErrorText(String(e.msg ?? e.raw ?? "")) }
+  // 已带版本戳的文案不再二次归一，避免把版本号切掉
+  const rawMsg = String(e.msg ?? e.raw ?? "")
+  const msg = /^\d+\.\d+\.\d+/.test(rawMsg) ? rawMsg : platformErrorText(rawMsg)
+  return { at: Number(e.at) || 0, msg }
+}
+
+/** 同步开始时清掉指定平台的旧失败记录，避免把上一版的错误继续展示在新脚本上。
+ *  这些记录写在 App Group 的 cc/syncErr.json，同一 App 里多个「包裹助手」副本可能共用。 */
+export function clearPlatformLastError(ids: string | string[]): void {
+  const list = Array.isArray(ids) ? ids : [ids]
+  try {
+    const f = `${FileManager.appGroupDocumentsDirectory}/cc/syncErr.json`
+    if (!FileManager.existsSync(f)) return
+    const prev = JSON.parse(FileManager.readAsStringSync(f) || "{}") || {}
+    let changed = false
+    for (const id of list) {
+      if (prev[id]) { delete prev[id]; changed = true }
+    }
+    if (changed) FileManager.writeAsStringSync(f, JSON.stringify(prev))
+  } catch { }
 }
 
 /** 轮换：每轮把指针往后挪一格，预算总是不够时也不会把同一平台饿死 */

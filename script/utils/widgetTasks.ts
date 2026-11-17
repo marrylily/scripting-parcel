@@ -314,14 +314,10 @@ export async function runWidgetTasks(snap: any, opts: { rebuildMin: number; ligh
   // 这是扩展最后一道保险：底层任何 Promise 卡住，也不能让它拖死本次 WidgetKit 唤醒。
   // 超时返回后请求由系统回收；没写完的结果不假装成功，下一轮按原节拍重试。
   const budget = Math.max(500, Number(opts.budgetMs) || 3000)
-  // 到点本轮立即收尾；调度锁保留一分钟，阻止迟到任务与下一次唤醒叠写。
-  let timer: any = null
-  try {
-    await Promise.race([
-      runWidgetTasksInner(snap, opts),
-      new Promise<void>(resolve => { timer = setTimeout(resolve, budget) }),
-    ])
-  } finally { if (timer != null) clearTimeout(timer) }
+  // 不用 setTimeout 包 race：本文件前面已说明，扩展进程里 Timer 会报
+  // “Timer requires its active script on the main JS execution queue”。
+  // 预算仍传给内部，由 Date.now() 协作式检查收尾（不取消已发出的请求）。
+  await runWidgetTasksInner(snap, { ...opts, budgetMs: budget })
 }
 
 async function runWidgetTasksInner(snap: any, opts: { rebuildMin: number; lightMin: number; fullMin: number; budgetMs?: number }): Promise<void> {

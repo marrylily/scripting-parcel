@@ -1,18 +1,10 @@
 import { COOKIE_KEY, Pkg, Snapshot, classify, closedOrderStatus, timeOfTrack, isHistoricalPkg, statusFromCode } from "./model"
 import { deadlineReached, waitCap } from "./syncSafety"
+import { safeDelay, pageTimeout } from "./safeTimer"
 
 /** 运行时全局 fetch（类型声明里没导出，跟 Response 情况一样） */
 declare const fetch: any
-/** setTimeout 在类型里签名不同，包一层 */
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
-
-/** 页面加载加超时：淘宝部分页会一直转圈不触发完成，不设超时会把同步拖死 */
-function pageTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = (setTimeout as any)(() => reject(new Error("页面超时")), ms)
-    p.then(v => { clearTimeout(t); resolve(v) }, e => { clearTimeout(t); reject(e) })
-  })
-}
+const delay = (ms: number) => safeDelay(ms)
 
 const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 

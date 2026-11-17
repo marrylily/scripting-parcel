@@ -11,6 +11,7 @@ import { queryTracking } from "../kdniao"
 import { fetchPackage as taobaoFetchPackage } from "./net"
 import { jdFetchPackage } from "./jd"
 import { pddFetchPackage } from "./pdd"
+import { safeDelay } from "./safeTimer"
 
 const ARRIVED_RE = /待取件|已到站|已到达|已投递|已暂存|已存放|已放入|已代收|请及时取|请及时领取|凭取件码|待领取|快递柜|驿站|代收点/
 
@@ -101,7 +102,7 @@ export async function refreshMailNos(
       if (u) out.set(String(it.no || it.orderId || ""), u)
     }))
     if (i + BATCH < items.length && !timeUp()) {
-      await new Promise<void>(res => setTimeout(() => res(), 300))
+      await safeDelay(300)
     }
   }
   return out
