@@ -1,9 +1,11 @@
 import { COOKIE_KEY, Pkg, Snapshot, classify, closedOrderStatus, timeOfTrack, isHistoricalPkg, statusFromCode } from "./model"
-import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded, formatBudgetExhausted } from "./syncSafety"
+import { deadlineReached, waitCap, formatStepTimeout, formatAuthNeeded, formatBudgetExhausted, remainingMs } from "./syncSafety"
 import { safeTimeoutRace, tryScheduleTimeout, safeClearTimeout, isTimerUnavailable } from "./safeTimer"
 import { beginTaobaoDiag, recordTaobaoStep, finishTaobaoDiag, abandonTaobaoDiag } from "./taobaoTrace"
-import { evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
+import { canBoundPageLoad, evaluateBounded, isPageCapability, isPageTimeout, loadPageBounded, settleWithin, PageCapabilityError } from "./pageBound"
+import { attachNavWatch, formatObservedTimeout, redactLocation } from "./navWatch"
 import { SyncSuperseded, bindRunCleanup, isSupersededError, runIsCurrent } from "./syncGate"
+import { classifySalvage, formatDiscoveryFailure, type StageHit } from "./taobaoDiscover"
 
 /** 运行时全局 fetch（类型声明里没导出，跟 Response 情况一样） */
 declare const fetch: any
@@ -380,21 +382,37 @@ function openTaobaoPage(ctx: TaobaoRun): WebViewController {
 }
 
 async function seedCookies(controller: WebViewController, ctx: TaobaoRun): Promise<void> {
-  for (const cookie of getCookies()) {
+  const cookies = getCookies()
+  let planned = 0
+  let accepted = 0
+  let failed = 0
+  for (const cookie of cookies) {
     throwIfStopped(ctx)
+    planned++
     const cap = waitCap(ctx.deadline, 5_000)
-    if (cap < 200) throw budgetError(ctx)
+    if (cap < 200) {
+      failed += cookies.length - planned + 1
+      break
+    }
     try {
       const result = await settleWithin(
-        () => Promise.resolve(controller.setCookie(cookie)).then(() => true, () => false),
+        () => Promise.resolve(controller.setCookie(cookie)).then((v: any) => v !== false, () => false),
         cap,
         { schedule: tryScheduleTimeout, clear: safeClearTimeout, nativeBound: false },
       )
-      if (!result.ok && result.reason === "capability") throw new PageCapabilityError()
+      if (!result.ok && result.reason === "capability") {
+        failed += cookies.length - planned + 1
+        if (!canBoundPageLoad(controller as any)) throw new PageCapabilityError()
+        break
+      }
+      if (!result.ok || result.value !== true) failed++
+      else accepted++
     } catch (e) {
-      if (isSupersededError(e) || isPageCapability(e) || /预算用尽/.test(String((e as any)?.message ?? e))) throw e
+      if (isSupersededError(e) || /预算用尽/.test(String((e as any)?.message ?? e))) throw e
+      failed++
     }
   }
+  recordTaobaoStep("写入登录态", 0, failed === 0, undefined, `计划${planned} 接受${accepted} 失败${failed}`, ctx.diagId)
 }
 
 /**
@@ -587,10 +605,20 @@ async function inspectAuthOrVerify(controller: WebViewController, ctx: TaobaoRun
   return null
 }
 
-function isFatalTaobaoError(e: any): boolean {
+/** 登录、验证、预算和计时能力会停掉整轮。导航超时不是，后面的已有路径还要继续。 */
+function stopsDiscovery(e: any): boolean {
   if (isSupersededError(e) || isPageCapability(e)) return true
   const msg = String(e?.message ?? e)
-  return /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用|淘宝·/.test(msg)
+  return /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用/.test(msg)
+}
+
+function hitFromError(e: any): StageHit {
+  if (isSupersededError(e)) throw e
+  const detail = String(e?.message ?? e)
+  if (isPageCapability(e) || /页面计时不可用/.test(detail)) return { type: "stop", reason: "capability", detail }
+  if (/预算用尽/.test(detail)) return { type: "stop", reason: "budget", detail }
+  if (/需重新登录|登录已失效|前台完成登录|不能自动跳过验证/.test(detail)) return { type: "stop", reason: "auth", detail }
+  return { type: "miss", detail }
 }
 
 /**
@@ -598,24 +626,35 @@ function isFatalTaobaoError(e: any): boolean {
  * loadRequest 的 timeoutInterval（秒）或 waitForLoad({ timeout, cancelOnTimeout }) 负责上限。
  * 加载成功后不再调用 waitForLoad，避免单页应用第二次加载事件一直不来。
  */
-async function loadAndWait(controller: WebViewController, url: string, ms: number, step: string, ctx: TaobaoRun, retries = 1): Promise<void> {
+async function loadAndWait(controller: WebViewController, url: string, ms: number, step: string, ctx: TaobaoRun, retries = 0, stopOnTimeout = true): Promise<void> {
   let last: Error | null = null
   for (let i = 0; i <= retries; i++) {
     throwIfStopped(ctx)
     const t0 = Date.now()
     const label = i ? `${step}（重试）` : step
     let recorded = false
+    let watch: Awaited<ReturnType<typeof attachNavWatch>> | null = null
     try {
       if (deadlineReached(ctx.deadline)) throw budgetError(ctx, url)
       const cap = waitCap(ctx.deadline, ms)
       if (cap < 1000) throw budgetError(ctx, url)
+      watch = await attachNavWatch(controller as any, t0)
       try {
-        await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout)
-      } catch (e) {
-        if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
-        if (isPageCapability(e)) throw e
-        if (isPageTimeout(e)) throw new Error(formatStepTimeout(step, Date.now() - t0, url))
-        throw e
+        try {
+          await loadPageBounded(controller as any, url, cap, step, tryScheduleTimeout, safeClearTimeout, stopOnTimeout)
+        } catch (e) {
+          if (watch?.authDetail) throw new Error(watch.authDetail)
+          if (ctx.syncId != null && !runIsCurrent(ctx.syncId)) throw new SyncSuperseded()
+          if (isPageCapability(e)) throw e
+          if (isPageTimeout(e)) throw new Error(formatObservedTimeout(step, Date.now() - t0, url, watch?.lastLocation || ""))
+          throw e
+        }
+        if (watch?.authDetail) throw new Error(watch.authDetail)
+      } finally {
+        for (const ev of watch?.events ?? []) {
+          recordTaobaoStep(`导航·${ev.type}`, ev.atMs, ev.kind === "other" || ev.kind === "empty", undefined, `${ev.location || "无"} id=${ev.navigationId}`, ctx.diagId)
+        }
+        try { await watch?.stop() } catch { /* 移除监听失败不改变本次加载结论 */ }
       }
       throwIfStopped(ctx)
       const auth = await inspectAuthOrVerify(controller, ctx)
@@ -627,9 +666,15 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
       if (isSupersededError(e)) throw e
       const err = e instanceof Error ? e : new Error(String(e?.message ?? e))
       last = err
-      if (!recorded) recordTaobaoStep(label, Date.now() - t0, false, url, String(err.message || "").slice(0, 80), ctx.diagId)
       const msg = String(err.message || "")
-      if (isPageCapability(e) || /需重新登录或完成验证|登录已失效|预算用尽|页面计时不可用/.test(msg)) throw err
+      if (!recorded) {
+        const observed = watch?.lastLocation || "无"
+        const note = /超时/.test(msg)
+          ? `请求 ${redactLocation(url) || "无"} 观察到 ${observed}`
+          : msg
+        recordTaobaoStep(label, Date.now() - t0, false, undefined, note, ctx.diagId)
+      }
+      if (stopsDiscovery(e) || /需重新登录|登录已失效|前台完成登录|不能自动跳过验证|预算用尽|页面计时不可用/.test(msg)) throw err
     }
   }
   throw last || new Error(formatStepTimeout(step, ms, url))
@@ -640,6 +685,83 @@ async function loadAndWait(controller: WebViewController, url: string, ms: numbe
  * 主线路：H5 Ultron。快递聚合 3.0 实测稳定。
  * 兜底：PC 版「已买到的宝贝」，DOM 里直接带 bizOrderId。
  */
+const H5_SALVAGE_JS = `return (function(){
+  try {
+    var ids = []
+    function push(v){ if (v && /^\\d{10,}$/.test(v) && ids.indexOf(v)<0 && ids.length<40) ids.push(v) }
+    var blob = ''
+    try { blob = window.currentUltronData ? JSON.stringify(window.currentUltronData) : '' } catch (e0) {}
+    var m, re1 = /bizOrderId=(\\d{10,})/g
+    while ((m = re1.exec(blob))) push(m[1])
+    var re2 = /"orderId":"(\\d{10,})"/g
+    while ((m = re2.exec(blob))) push(m[1])
+    var text = ''
+    try { text = document.body ? document.body.innerText.slice(0, 500) : '' } catch (e1) {}
+    var href = String(location.href || '').split('?')[0].split('#')[0]
+    return JSON.stringify({
+      href: href,
+      host: location.host || '',
+      ready: document.readyState || '',
+      htmlLen: document.documentElement ? document.documentElement.outerHTML.length : 0,
+      ids: ids.join(','),
+      emp: /没有找到|暂无订单|还没有订单|无相关订单|没有相关订单/.test(text),
+      verify: /滑动验证|请完成验证|安全验证|人机验证|滑块验证|验证码|captcha/i.test(text)
+    })
+  } catch (e2) { return '{}' }
+})()`
+
+function salvageLooksLikeAuth(host: string, href: string): boolean {
+  return /^login[\d.]*\.(taobao|tmall)\.com$/i.test(host)
+    || /login\.m\.taobao\.com/i.test(host)
+    || /(passport|havanaone|havana)\.(taobao|tmall)\.com/i.test(host)
+    || /\/(member\/login|login\/login)/i.test(href)
+}
+
+/** 导航超时后只读已经提交的文档。不把空文档当成同步成功。 */
+async function salvageH5(controller: WebViewController, ctx: TaobaoRun): Promise<StageHit> {
+  const t0 = Date.now()
+  try {
+    const raw = String(await evalPage(controller, H5_SALVAGE_JS, 4_000, "超时后读取H5", ctx) || "{}")
+    let info: any = {}
+    try { info = JSON.parse(raw) } catch { info = {} }
+    const ids = String(info.ids || "").split(",").map((id: string) => id.trim()).filter(Boolean)
+    const href = redactLocation(String(info.href || ""))
+    const verify = !!info.verify
+    const auth = verify || salvageLooksLikeAuth(String(info.host || ""), href)
+    const cls = classifySalvage({
+      ids,
+      auth,
+      verify,
+      readyState: String(info.ready || ""),
+      htmlLen: Number(info.htmlLen) || 0,
+      emptyConfirmed: !!info.emp,
+    })
+    if (cls === "orders") {
+      recordTaobaoStep("超时后读取H5", Date.now() - t0, true, href, `${ids.length} 单`, ctx.diagId)
+      return { type: "orders", ids, detail: `超时后读取到 ${ids.length} 单` }
+    }
+    if (cls === "auth") {
+      const detail = formatAuthNeeded(href)
+      recordTaobaoStep("超时后读取H5", Date.now() - t0, false, href, "登录或验证", ctx.diagId)
+      return { type: "stop", reason: "auth", detail }
+    }
+    recordTaobaoStep("超时后读取H5", Date.now() - t0, false, href, "页面未完成，不作为空单", ctx.diagId)
+    return { type: "miss", detail: "淘宝·超时后页面未完成，不作为空单" }
+  } catch (e) {
+    if (isSupersededError(e)) throw e
+    const hit = hitFromError(e)
+    if (hit.type === "stop" && hit.reason === "auth") return hit
+    if (hit.type === "stop" && hit.reason === "budget") return hit
+    if (hit.type === "stop" && hit.reason === "capability" && !canBoundPageLoad(controller as any)) return hit
+    recordTaobaoStep("超时后读取H5", Date.now() - t0, false, undefined, "未能读取", ctx.diagId)
+    return { type: "miss", detail: "淘宝·超时后读取失败，继续下一路径" }
+  }
+}
+
+function budgetStop(ctx: TaobaoRun, stages: string[]): Error {
+  return new Error(formatDiscoveryFailure([...stages, formatBudgetExhausted(Date.now() - ctx.roundStart)]))
+}
+
 /** 上一轮淘宝订单页是否真的渲染出来了。
  *  订单为 0 有两种可能：页面没加载（故障）和用户确实没买东西（正常）。
  *  只有页面没就绪才算失败，否则会把“空订单”永远报成错误。*/
@@ -651,12 +773,15 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
   const controller = openTaobaoPage(ctx)
   try {
     await seedCookies(controller, ctx)
+    const stages: string[] = []
 
     let needVerify = false
+    let h5Noted = false
     try {
       if (deadlineReached(ctx.deadline)) throw budgetError(ctx)
-      await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "加载H5订单页", ctx)
-      if (!await atLoginPage(controller, ctx)) {
+      await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "加载H5订单页", ctx, 0, false)
+      if (await atLoginPage(controller, ctx)) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
+      {
         let blob = ""
         for (let i = 0; i < 15; i++) {
           if (deadlineReached(ctx.deadline)) break
@@ -693,15 +818,26 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
         if (TB_VERIFY_RE.test(vt)) needVerify = true
       }
     } catch (e: any) {
-      if (isFatalTaobaoError(e)) throw e
+      const hit = hitFromError(e)
+      if (hit.type === "stop") throw new Error(hit.detail)
+      if (/超时/.test(hit.detail)) {
+        const salvage = await salvageH5(controller, ctx)
+        if (salvage.type === "orders") { markPage(ctx, true); return salvage.ids }
+        if (salvage.type === "stop") throw new Error(salvage.detail)
+      }
+      stages.push(hit.detail)
+      h5Noted = true
     }
     if (needVerify) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
+    if (!h5Noted) stages.push("淘宝·H5订单页未发现订单")
+    if (remainingMs(ctx.deadline) < 1000) throw budgetStop(ctx, stages)
 
     if (deadlineReached(ctx.deadline)) throw budgetError(ctx)
     const pcIds: string[] = []
     const pushPc = (v: string) => { if (v && !pcIds.includes(v)) pcIds.push(v) }
     let needLogin = false
     let pageOk = false
+    let pcNoted = false
     try {
       await loadAndWait(controller, "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm", 25_000, "加载PC订单页", ctx)
       try { await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx) } catch (e) {
@@ -725,7 +861,7 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
           await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx)
           if (await atLoginPage(controller, ctx)) needLogin = true
         } catch (e) {
-          if (isSupersededError(e) || isPageCapability(e) || isFatalTaobaoError(e)) throw e
+          if (isSupersededError(e) || stopsDiscovery(e)) throw e
         }
         if (!needLogin) await waitForOrders(controller, 12_000, ctx)
       }
@@ -777,16 +913,27 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
         if (isSupersededError(e) || isPageCapability(e)) throw e
       }
     } catch (e: any) {
-      if (isFatalTaobaoError(e)) throw e
+      const hit = hitFromError(e)
+      if (hit.type === "stop") throw new Error(hit.detail)
+      if (pcIds.length > 0) { markPage(ctx, true); return pcIds }
+      stages.push(hit.detail)
+      pcNoted = true
     }
     if (needLogin) throw new Error(formatAuthNeeded(await currentPageUrl(controller, ctx)))
     if (pcIds.length > 0) { markPage(ctx, true); return pcIds }
-
-    if (deadlineReached(ctx.deadline)) {
-      if (pcIds.length > 0) { markPage(ctx, true); return pcIds }
-      throw budgetError(ctx, await currentPageUrl(controller, ctx))
+    if (pageOk) { markPage(ctx, true); return [] }
+    if (!pcNoted) stages.push("淘宝·PC订单页未发现订单")
+    if (remainingMs(ctx.deadline) < 1000) throw budgetStop(ctx, stages)
+    let fallbackMiss = ""
+    try {
+      await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "兜底加载H5订单页", ctx, 0, false)
+    } catch (e: any) {
+      const hit = hitFromError(e)
+      if (hit.type === "stop") throw new Error(hit.detail)
+      fallbackMiss = hit.detail
+      stages.push(hit.detail)
     }
-    await loadAndWait(controller, "https://h5.m.taobao.com/mlapp/olist.html", 20_000, "兜底加载H5订单页", ctx)
+    if (!fallbackMiss) {
     try { await evalPage(controller, CLEAR_OVERLAYS, 3_000, "清理遮挡", ctx) } catch (e) {
       if (isSupersededError(e) || isPageCapability(e)) throw e
     }
@@ -824,8 +971,9 @@ export async function discoverOrderIds(ctx: TaobaoRun): Promise<string[]> {
         if (isSupersededError(e) || isPageCapability(e)) throw e
       }
     }
-    if (ids.length > 0 || pageOk) markPage(ctx, true)
-    return ids
+    if (ids.length > 0) { markPage(ctx, true); return ids }
+    }
+    throw new Error(formatDiscoveryFailure(stages))
   } finally {
     try { ctx.dispose?.() } catch { /* 发现订单结束就释放页面 */ }
   }

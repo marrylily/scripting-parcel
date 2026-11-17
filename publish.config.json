@@ -6,6 +6,6 @@
   "remoteResourceUrl": "https://github.com/marrylily/scripting-parcel/tree/main/script",
   "autoUpdateIntervalSeconds": 3600,
   "scriptName": "包裹助手（远程更新）",
-  "scriptVersion": "1.2.7",
+  "scriptVersion": "1.2.8",
   "note": "远程更新仓库 marrylily/scripting-parcel。若更改仓库名、所有者或分支，请同步改本文件，以及 script/script.json 的 remoteResource.url 和仓库根 README 中的链接。不要在 remoteResource 里自行填写 hash。"
 }

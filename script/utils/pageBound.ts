@@ -115,11 +115,21 @@ export async function settleWithin<T>(start: () => Promise<T>, ms: number, opts:
   }
 }
 
+/** 官方 loadRequest 或 waitForLoad 的 timeout 能限制加载。只有 loadURL 时必须有脚本计时器。 */
+export function canBoundPageLoad(page: PageSurface): boolean {
+  return typeof page.loadRequest === "function"
+    || (typeof page.waitForLoad === "function" && typeof page.loadURL === "function")
+}
+
 function stopQuiet(page: PageSurface): void {
   try { silence(page.stopLoading?.()) } catch { /* 页面可能已经关掉 */ }
 }
 
-/** 只等一次加载。有 loadRequest 时不再调用 waitForLoad。 */
+/**
+ * 只等一次加载。有 loadRequest 时不再调用 waitForLoad。
+ * stopOnTimeout 为 false 时，到点只结束等待，不调用 stopLoading，方便接着读已经提交的文档。
+ * 官方：loadRequest 成功只表示主文档加载成功；失败、取消或被替换为 false。timeoutInterval 是这次导航请求的超时（秒）。
+ */
 export async function loadPageBounded(
   page: PageSurface,
   url: string,
@@ -127,18 +137,20 @@ export async function loadPageBounded(
   step: string,
   schedule: TimerSchedule,
   clear: TimerClear,
+  stopOnTimeout = true,
 ): Promise<void> {
   const seconds = Math.max(0.05, ms / 1000)
   const fail = (reason: "timeout" | "capability") => {
     if (reason === "capability") throw new PageCapabilityError()
     throw new PageTimeoutError(step)
   }
+  const onTimeout = stopOnTimeout ? () => stopQuiet(page) : undefined
 
   if (typeof page.loadRequest === "function") {
     const result = await settleWithin(
       () => page.loadRequest!({ url, timeoutInterval: seconds }),
       ms,
-      { schedule, clear, nativeBound: true, onTimeout: () => stopQuiet(page) },
+      { schedule, clear, nativeBound: true, onTimeout },
     )
     if (!result.ok) fail(result.reason)
     if (result.value !== true) throw new PageTimeoutError(step)
@@ -149,10 +161,10 @@ export async function loadPageBounded(
     const result = await settleWithin(
       () => {
         silence(page.loadURL!(url))
-        return page.waitForLoad!({ timeout: seconds, cancelOnTimeout: true })
+        return page.waitForLoad!({ timeout: seconds, cancelOnTimeout: stopOnTimeout })
       },
       ms,
-      { schedule, clear, nativeBound: true, onTimeout: () => stopQuiet(page) },
+      { schedule, clear, nativeBound: true, onTimeout },
     )
     if (!result.ok) fail(result.reason)
     if (result.value !== true) throw new PageTimeoutError(step)

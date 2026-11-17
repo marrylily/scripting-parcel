@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.7 remote-update edition. Taobao sync uses per-run diagnostics, one page lock, and official WebView timeouts so a hung load cannot leave the button spinning. Does not guarantee proxy connectivity. Auth and keys unchanged.",
+  "description": "ParcelPal 1.2.8 remote-update edition. An H5 order-page timeout no longer skips the PC order page. Login and challenge pages still stop the round. Empty documents are not treated as success. Does not guarantee proxy connectivity.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.7 远程更新版：淘宝同步按轮次记录诊断，同一时间只开一轮页面；加载使用官方超时，结束后按钮会收回。不保证代理网络一定能连上。登录与密钥逻辑未改。",
-    "en": "1.2.7 remote-update edition. Taobao sync keeps per-run diagnostics and one page at a time. Loads use the official timeout, and the button resets when the round ends. This does not guarantee proxy connectivity. Auth and keys unchanged."
+    "zh": "1.2.8 远程更新版：淘宝 H5 订单页超时后，预算还够就会继续已有的 PC 订单页。登录和验证页仍会停止。空页面不会当成同步成功。不保证代理网络一定能连上。",
+    "en": "1.2.8 remote-update edition. After the Taobao H5 order page times out, the existing PC order page still runs when budget remains. Login and challenge pages still stop the round. An empty document is not a successful sync. This does not guarantee proxy connectivity."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",
