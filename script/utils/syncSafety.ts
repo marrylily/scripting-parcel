@@ -8,7 +8,8 @@ import { APP_VERSION } from "./version"
 
 export { APP_VERSION }
 
-export const MANUAL_SYNC_MS = 120_000
+/** 前台手动同步（尤其淘宝 WebView 发现订单）的协作式预算，不是硬超时。 */
+export const MANUAL_SYNC_MS = 180_000
 export const HUMAN_VERIFY_MIN_MS = 15_000
 
 /** 失败文案带版本和时间，便于区分旧版残留与本轮新失败。 */
@@ -45,6 +46,31 @@ export function orderForManualSync(ids: string[]): string[] {
   const cn = ids.filter(id => id === "cainiao")
   const rest = ids.filter(id => id !== "cainiao")
   return [...cn, ...rest]
+}
+
+/** 只保留 host+path，去掉查询参数和片段，避免把 Cookie/token 带进文案。 */
+export function pageUrlOf(raw: string): string {
+  const s = String(raw ?? "").trim()
+  if (!s) return ""
+  try {
+    const u = new URL(s.includes("://") ? s : `https://${s}`)
+    const path = (u.pathname || "/").replace(/\/+$/, "") || "/"
+    return `${u.host}${path === "/" ? "" : path}`
+  } catch {
+    return s.split("?")[0].split("#")[0].replace(/^https?:\/\//, "").slice(0, 80)
+  }
+}
+
+/** 超时文案：步骤名 + 耗时 + 当前页（仅 host+path）。 */
+export function formatStepTimeout(step: string, elapsedMs: number, pageUrl?: string): string {
+  const sec = (Math.max(0, Number(elapsedMs) || 0) / 1000).toFixed(1)
+  const loc = pageUrl ? ` ${pageUrlOf(pageUrl)}` : ""
+  return `淘宝·${step}超时 ${sec}s${loc}`
+}
+
+export function formatAuthNeeded(pageUrl?: string): string {
+  const loc = pageUrl ? ` ${pageUrlOf(pageUrl)}` : ""
+  return `淘宝需重新登录或完成验证${loc}`
 }
 
 /** 去掉 Cookie/Token/带查询的链接后再给界面看。 */
