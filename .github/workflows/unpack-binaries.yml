@@ -1,0 +1,34 @@
+name: unpack-binaries
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "build/binaries.base64"
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode binaries and remove pack files
+        run: |
+          set -euo pipefail
+          if [ ! -f build/binaries.base64 ]; then
+            echo "payload missing, nothing to do"
+            exit 0
+          fi
+          base64 -d build/binaries.base64 > /tmp/binaries.tar
+          tar -xf /tmp/binaries.tar -C .
+          test -f "releases/包裹助手_远程更新_1.2.3.zip"
+          test -f script/assets/identity/alipay.png
+          rm -rf build
+          rm -f .github/workflows/unpack-binaries.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short | head -80
+          git commit -m "Add binary assets and release zip"
+          git push
