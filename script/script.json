@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.5 remote-update edition. Foreground/open/pull-to-refresh run Taobao discovery like other platforms; last-sync updates even with 0 new orders; skips are stamped with version. Auth and keys unchanged.",
+  "description": "ParcelPal 1.2.6 remote-update edition. Clearer Taobao timeouts with step, duration and page path; retries; login/verify distinguished from timeout. Auth and keys unchanged.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.5 远程更新版：打开 App、下拉刷新、全量同步时淘宝与其他平台一样参与；成功（含 0 个新订单）更新上次同步；被跳过时显示带版本号的原因。登录与密钥逻辑未改。",
-    "en": "1.2.5 remote-update edition. Opening the app, pull-to-refresh, and full sync include Taobao like other platforms; last-sync updates even with 0 new orders; skipped runs show a version-stamped reason. Auth and keys unchanged."
+    "zh": "1.2.6 远程更新版：淘宝超时会写出步骤、耗时和当前页面路径，可重试一步，登录/验证页不再误报成超时。登录与密钥逻辑未改。",
+    "en": "1.2.6 remote-update edition. Taobao timeouts name the step, duration and page path; retry once; login/verify is not reported as a timeout. Auth and keys unchanged."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",

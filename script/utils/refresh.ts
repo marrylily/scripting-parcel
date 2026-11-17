@@ -73,7 +73,7 @@ export async function refreshAll(reason: RefreshReason = "app"): Promise<Refresh
   }
   // 全量发现与轻量刷新分开：小组件刚刷过已有物流时，不能再挡住淘宝在前台发现新单。
   try {
-    const full = await maybeFullSync(60_000, { gapMs: foregroundFullGapMs() })
+    const full = await maybeFullSync(120_000, { gapMs: foregroundFullGapMs() })
     changed += full.added
     if (full.attempted || full.ok.length) fetched = true
   } catch { }
@@ -102,7 +102,7 @@ export async function refreshNow(): Promise<RefreshResult> {
     changed = await refreshTrackedPackages({ platforms: true, force: true, minGapMs: 0 })
   } catch { }
   try {
-    const full = await maybeFullSync(90_000, { gapMs: 2 * 60_000 })
+    const full = await maybeFullSync(150_000, { gapMs: 2 * 60_000 })
     changed += full.added
   } catch { }
   try { void dedupeDeliveredReminders() } catch { }

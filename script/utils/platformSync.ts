@@ -23,7 +23,7 @@ import { miHasLogin, miFetchList, miFetchDetail, parseMiTraces, type MiExpressIt
 import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, trackMailNo as cnTrackMailNo } from "./cainiao"
 import { notify } from "../ui/notify"
 import { warningIconData } from "./notifyIcon"
-import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel } from "./syncSafety"
+import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel, sanitizeSyncMessage } from "./syncSafety"
 import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 type Source = "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
@@ -371,16 +371,25 @@ const AUTH_RE = /未登录|请先登录|还没授权|登录已失效|登录态.{
  * 平台原始错误 → 一句人话。授权页、平台详情页、系统通知都调这一份，
  * 保证同一个故障在任何地方看到的字都一样（用户反馈过两处文案对不上）。
  */
+function sanitizeDetail(t: string): string {
+  return sanitizeSyncMessage(t, 80)
+}
+
 export function platformErrorText(raw: string): string {
   const t = String(raw ?? "").replace(/\s+/g, " ").trim()
   if (!t) return "同步失败"
   if (/未绑定取件手机号/.test(t)) return "未绑定取件手机号，请先绑定"
+  if (/需重新登录或完成验证/.test(t)) return sanitizeDetail(t)
   if (/人机验证|滑块|需要手动完成/.test(t)) return "需要人机验证，请手动完成"
   if (/限流|排队|大促|访问频繁/.test(t)) return "访问被限流，稍后自动恢复"
+  // 已带步骤名/耗时的超时不要再收成「网络超时，请稍后重试」
+  if (/淘宝·.+超时|超时 \d+\.\d+s/.test(t) || (/超时|timeout/i.test(t) && /https?:\/\/|\s[a-z0-9.-]+\//i.test(t))) {
+    return sanitizeDetail(t)
+  }
   if (/超时|timeout/i.test(t)) return "网络超时，请稍后重试"
   if (AUTH_RE.test(t)) return "登录已失效，请重新授权"
   // 接口返回码/网关异常原样保留，后台报障时能直接对上
-  return t.slice(0, 44)
+  return sanitizeDetail(t)
 }
 
 /** 记录一个平台的结论（成功/失败/跳过只有一个入口） */

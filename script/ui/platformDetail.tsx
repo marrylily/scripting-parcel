@@ -11,7 +11,8 @@ import {
   platformEnabled, platformState, setPlatformEnabled, type PlatformId,
 } from "../platforms"
 import { miPhones, platformLastSyncedAt, syncPlatformParcels, clearPlatformLastError, platformSyncHint } from "../utils/platformSync"
-import { sanitizeSyncMessage } from "../utils/syncSafety"
+import { sanitizeSyncMessage, MANUAL_SYNC_MS } from "../utils/syncSafety"
+import { readTaobaoDiag } from "../utils/taobaoTrace"
 import { PddMobileSection } from "./pddMobiles"
 import { MiPhoneSection } from "./miPhones"
 import { fcMobile } from "../utils/fengchao"
@@ -54,13 +55,13 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
       // 只认平台结论（与授权页、通知同一份），不再拿平台名字去 errors 里模糊匹配：
       // 「小米快递聚合」与「小米快递」对不上，就会把真实原因吐成「同步未完成」。
       const report = await syncPlatformParcels((t) => setSyncText(t || "同步中…"),
-        { force: true, quietIssues: true, deadline: Date.now() + 90_000, only: [id] })
+        { force: true, quietIssues: true, deadline: Date.now() + MANUAL_SYNC_MS, only: [id] })
       const res = report?.results?.[id]
       if (res?.outcome === "ok") notify(`${name}已同步`)
       else if (!res) notify(`${name}未启用，请先授权或打开开关`, "warn")
-      else notify(sanitizeSyncMessage(String(res.message || "未完成"), 40), res.outcome === "failed" ? "warn" : "info")
+      else notify(sanitizeSyncMessage(String(res.message || "未完成"), 80), res.outcome === "failed" ? "warn" : "info")
     } catch (e: any) {
-      notify(sanitizeSyncMessage(String(e?.message ?? e), 40) || "同步失败", "error")
+      notify(sanitizeSyncMessage(String(e?.message ?? e), 80) || "同步失败", "error")
     } finally {
       setBusy(false)
       setSyncText("")
@@ -168,6 +169,38 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
           </Button>
         </HStack>
       </Section>
+
+      {id === "taobao" ? <TaobaoDiagSection rev={rev} /> : null}
     </SubPage>
+  )
+}
+
+function sec(ms: number): string {
+  return `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(1)}秒`
+}
+
+function TaobaoDiagSection({ rev }: { rev: number }) {
+  void rev
+  const d = readTaobaoDiag()
+  if (!d || !d.steps.length) return null
+  const when = (() => {
+    const x = new Date(d.at)
+    const p = (n: number) => String(n).padStart(2, "0")
+    return `${p(x.getMonth() + 1)}-${p(x.getDate())} ${p(x.getHours())}:${p(x.getMinutes())}`
+  })()
+  return (
+    <Section title="诊断" footer="最近一次淘宝同步各步耗时，仅本机保存，不含 Cookie 和查询参数。">
+      <VStack alignment="leading" spacing={4} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
+        <Text font={13} foregroundStyle={C.secondary}>
+          {`${d.version} ${when} · 共 ${sec(d.totalMs)} · ${d.ok ? "成功" : "未完成"}`}
+        </Text>
+        {d.error ? <Text font={12} foregroundStyle={C.orange} multilineTextAlignment="leading">{d.error}</Text> : null}
+        {d.steps.map((s, i) => (
+          <Text key={`${s.name}-${i}`} font={12} foregroundStyle={s.ok ? C.tertiary : C.orange} multilineTextAlignment="leading">
+            {`${s.ok ? "完成" : "失败"} ${s.name} ${sec(s.ms)}${s.url ? `  ${s.url}` : ""}`}
+          </Text>
+        ))}
+      </VStack>
+    </Section>
   )
 }
