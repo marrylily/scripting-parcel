@@ -1,3 +1,4 @@
+import { safeDelay } from "./safeTimer"
 // 拼多多 anti-content 的取用方式：加载官方 mdkd 页面，让官方 webpack 里的反爬模块自己算一个令牌出来。
 //
 // 边界（用户 2026-11-14 明确定义）：单账号、本人实时操作、只在 WebView 里加载官方页面，
@@ -13,7 +14,7 @@ const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/6
 declare const WebViewController: any
 
 function delay(ms: number): Promise<void> {
-  return new Promise<void>(r => setTimeout(r, ms))
+  return safeDelay(ms)
 }
 
 let ctrl: any = null

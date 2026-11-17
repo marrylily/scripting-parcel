@@ -11,6 +11,7 @@
  *  ssecurity+nonce → clientSign=Base64(SHA1("nonce=..&ssecurity")) → GET location 带
  *  clientSign（禁止重定向）→ Set-Cookie 里的 serviceToken 就是接口凭证。
  */
+import { safeDelay } from "./safeTimer"
 // Data/Crypto 是全局（scripting dts 没导出，运行时可用；相关记忆 globals-are-not-module-exports）
 declare const Data: any
 declare const Crypto: any
@@ -120,7 +121,7 @@ export async function miMintToken(): Promise<{ token: string; cUserId: string }>
 
 /* ---------------- 接口调用（wrapBody + 加密 + 签名） ---------------- */
 
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
+const delay = (ms: number) => safeDelay(ms)
 
 function wrapBody(plain: string, userId: string): string {
   // iOS 没有 OAID/MIUI 环境：照抄字段名、传伪值/空值，服务端是否校验未验证

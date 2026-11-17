@@ -10,6 +10,7 @@
  */
 import { Notification } from "scripting"
 import { getLocations } from "../store"
+import { safeDelay } from "./safeTimer"
 
 type Req = { identifier: string, content?: any, trigger?: any }
 
@@ -25,7 +26,7 @@ export async function locationMode(): Promise<LocMode> {
   try {
     const r: any = await Promise.race([
       g.startUpdatingLocation({ requestAlwaysAuthorization: true }),
-      new Promise(res => setTimeout(() => res("timeout"), 5000)),
+      safeDelay(5000).then(() => "timeout"),
     ])
     if (r === "timeout" || r == null) return "unknown"
     const m = typeof r === "object" ? r.mode : null

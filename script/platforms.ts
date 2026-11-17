@@ -6,7 +6,8 @@
  * 授权后的「同步包裹」在 sync.ts（复用聚合脚本的解析逻辑，同一套 Keychain key）。
  */
 declare const fetch: any
-const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
+import { safeDelay } from "./utils/safeTimer"
+const delay = (ms: number) => safeDelay(ms)
 
 // 解除授权用各平台自己的清理函数：它们除了删 Keychain，还会清 WebView 持久 Cookie 仓库，
 // 只删 Keychain 的话下次授权会被旧会话自动登录。
