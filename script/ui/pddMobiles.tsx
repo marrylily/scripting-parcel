@@ -14,6 +14,7 @@ import {
   type PddBindPreCheck, type PddBoundMobile,
 } from "../utils/pddExpress"
 import { pddAntiCleanup } from "../utils/pddAnti"
+import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
 
 export type PddMobiles = { pre: PddBindPreCheck | null; mobiles: PddBoundMobile[]; onlyWxScan?: boolean; waiting?: number }
 
@@ -54,8 +55,8 @@ export function PddMobileSection({ authed, bump }: {
 
   useEffect(() => {
     if (left <= 0) return
-    const t = setTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000)
-    return () => clearTimeout(t)
+    const { id: t, scheduled } = tryScheduleTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000); if (!scheduled) { /* 倒计时不可用则停在当前秒 */ }
+    return () => safeClearTimeout(t)
   }, [left])
 
   useEffect(() => {

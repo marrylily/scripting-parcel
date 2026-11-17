@@ -4,6 +4,7 @@
 import { Button, VStack, useState } from "scripting"
 import { getStations, type Pickup } from "../store"
 import { ParcelCardRow } from "./parcelCard"
+import { tryScheduleTimeout } from "../utils/safeTimer"
 
 export { CompanyLogo, pickupCompanyLabel } from "./parcelCard"
 
@@ -16,7 +17,7 @@ export function PickupRow({ item, onTap, swipe }: { item: Pickup; onTap?: () => 
   const runSwipe = (s: SwipeAction) => {
     s.action()
     // 等动作带来的数据刷新落地后再重建，避免同一次渲染里被合并掉
-    setTimeout(() => setSwipeGen(g => g + 1), 20)
+    tryScheduleTimeout(() => setSwipeGen(g => g + 1), 20)
   }
   return (
     <VStack spacing={0} frame={{ maxWidth: "infinity", alignment: "leading" }} padding={{ bottom: 8 }}>

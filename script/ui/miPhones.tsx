@@ -7,6 +7,7 @@ import { FormActions, InputLine, Row, Section, SectionHeader } from "./kit"
 import { notify } from "./notify"
 import { miSendCode, miCheckCode, miBindPhone } from "../utils/mi"
 import { miPhones, miSetPhones } from "../utils/platformSync"
+import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
 
 const digits = (v: string, n: number) => v.replace(/[^0-9]/g, "").slice(0, n)
 
@@ -24,8 +25,8 @@ export function MiPhoneSection({ authed, bump }: {
 
   useEffect(() => {
     if (left <= 0) return
-    const t = setTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000)
-    return () => clearTimeout(t)
+    const { id: t, scheduled } = tryScheduleTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000); if (!scheduled) { /* 倒计时不可用则停在当前秒 */ }
+    return () => safeClearTimeout(t)
   }, [left])
 
   const canSend = phone.length === 11

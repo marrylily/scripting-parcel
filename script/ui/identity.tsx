@@ -14,6 +14,7 @@ import { markPlatform } from "../platforms"
 import { pddHasLogin } from "../utils/pdd"
 import { notify } from "./notify"
 import { Barcode } from "./barcode"
+import { tryScheduleInterval, safeClearInterval } from "../utils/safeTimer"
 
 const META: Record<IdentityBrand, { icon: string; bg: any; fg: any }> = {
   taobao: { icon: "qrcode", bg: alpha("#F08A2E", 0.14), fg: C.orange },
@@ -139,8 +140,8 @@ export function IdentityCodeSheet({ id, close, open }: {
   const exp = (id === "cainiao" ? live?.expiresAt : id === "taobao" ? tbLive?.expiresAt : id === "pdd" ? pddLive?.expiresAt : 0) ?? 0
   useEffect(() => {
     if (!exp) return
-    const t = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(t)
+    const { id: t } = tryScheduleInterval(() => setNow(Date.now()), 1000)
+    return () => safeClearInterval(t)
   }, [exp])
 
   const liveCode = (id === "cainiao" ? live?.code : id === "taobao" ? tbLive?.code : id === "pdd" ? pddLive?.code : "") ?? ""
