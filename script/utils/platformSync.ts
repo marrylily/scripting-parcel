@@ -23,7 +23,8 @@ import { miHasLogin, miFetchList, miFetchDetail, parseMiTraces, type MiExpressIt
 import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, trackMailNo as cnTrackMailNo } from "./cainiao"
 import { notify } from "../ui/notify"
 import { warningIconData } from "./notifyIcon"
-import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel, sanitizeSyncMessage } from "./syncSafety"
+import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel, sanitizeSyncMessage, MANUAL_SYNC_MS } from "./syncSafety"
+import { acquireSyncRun, isSupersededError, releaseSyncRun, runIsCurrent } from "./syncGate"
 import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 type Source = "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
@@ -312,6 +313,8 @@ export interface PlatformSyncReport {
   ran?: string[]
   /** 按平台 id 索引的结论（新界面请只用这个） */
   results: Record<string, PlatformSyncResult>
+  /** 已有一轮同步持有页面。自动轮次直接退出，不记失败。 */
+  busy?: boolean
 }
 
 /** 点「已取件」时最后拉一次物流：把最终节点存下来，之后这个包裹不再更新。
@@ -695,9 +698,17 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
 /* ---------------- 手动/打开 App 时的全量同步：发现新订单 ---------------- */
 
 /** 全量同步三个平台（只跑已授权的），把结果并进包裹列表 */
-export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean; gapMs?: number }): Promise<PlatformSyncReport> {
+export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean; gapMs?: number; preempt?: boolean }): Promise<PlatformSyncReport> {
   const report: PlatformSyncReport = { added: 0, updated: 0, errors: [], skipped: [], ran: [], results: {} }
   const deadline = opts?.deadline ?? Number.POSITIVE_INFINITY
+  const lockUntil = Number.isFinite(deadline) ? deadline : Date.now() + MANUAL_SYNC_MS
+  // 手动同步取代正在跑的自动同步。自动同步碰到未过期的锁就退出，避免两轮页面互相改诊断。
+  const slot = acquireSyncRun(opts?.preempt ? "manual" : "auto", lockUntil)
+  if (!slot.ok) {
+    report.busy = true
+    return report
+  }
+  try {
   const timeUp = () => Date.now() > deadline
   const before = getPickups().length
   const cap = platformCapability()
@@ -721,12 +732,14 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   const succeededAt = readPlatformLast()
   // 手动全量让菜鸟先跑：它不依赖 WebView。自动/组件同步仍轮换。
   const ordered = opts?.force ? orderForManualSync(ids) : rotateOrder(ids)
+  if (!runIsCurrent(slot.id)) return report
   // 本轮即将同步的平台先清旧失败，再写本轮结果（带版本和时间）
   if (opts?.force && ordered.length) {
     clearPlatformLastError(ordered)
     clearPlatformLastSkip(ordered)
   }
   for (const id of ordered) {
+    if (!runIsCurrent(slot.id)) return report
     if (!opts?.force && !platformDue(succeededAt[id], gapMs)) {
       const msg = `距上次成功不足 ${gapLabel(gapMs)}，已跳过`
       skipPlatform(report, id, msg)
@@ -766,17 +779,18 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
         )
         const snap = await (async () => {
           try {
-            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb)
+            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb, slot.id)
           } catch (first: any) {
+            if (isSupersededError(first) || !runIsCurrent(slot.id)) throw first
             // 只有真滑块/安全验证才弹页给人；其他错误不打扰
             const needHuman = /人机验证/.test(String(first?.message ?? first))
             if (!needHuman || opts?.silent) throw first
             // 预算不够就不要打开最长 3 分钟的验证页，避免挡住后续平台；验证要求仍返回给界面。
             if (!shouldStartHumanVerify(deadline)) throw first
             onProgress?.("淘宝需要验证…")
-            const ok2 = await taobaoHumanVerify()
+            const ok2 = await taobaoHumanVerify(deadline, slot.id)
             if (!ok2) throw first
-            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb)
+            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb, slot.id)
           }
         })()
         for (const p of snap.packages) {
@@ -925,6 +939,7 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
       clearPlatformLastSkip(id)
       setResult(report, id, "ok", "")
     } catch (e) {
+      if (isSupersededError(e) || !runIsCurrent(slot.id)) return report
       // 京东排队/限流：标记 30 分钟冷却，后续同步（含组件后台）不再撞墙
       if (id === "jd" && /限流|排队|大促/.test(String((e as any)?.message ?? e))) {
         markJdCooling()
@@ -967,6 +982,9 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   }
   await delay(0)
   return report
+  } finally {
+    releaseSyncRun(slot.id)
+  }
 }
 
 /* ---------------- 定时全量：App 与小组件共用 ---------------- */
@@ -1170,7 +1188,6 @@ function rotateOrder(ids: string[]): string[] {
 
 /** 全量同步时间戳放共享目录：App 和小组件是两个进程，各存一份 Storage 就做不到“谁跑过另一边跳过” */
 const FULL_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/fullSync.json`
-const FULL_LOCK_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/fullSyncLock.json`
 
 export function readFullSyncAt(): number {
   let best = 0
@@ -1207,17 +1224,12 @@ export type MaybeFullSyncResult = { added: number; attempted: boolean; ok: strin
 
 /** 每平台到期才发现新订单。不再用「任意平台刚跑过」的全局 3 小时闸门挡住淘宝：
  *  小组件常先跑通菜鸟/小米/丰巢并写入 fullSync 时间戳，原先会让 App 打开时整轮直接 return。
- *  短锁只防两进程同时开跑，不挡到期平台。
+ *  是否与另一轮重叠，由 syncPlatformParcels 的整轮锁决定，并在结束时释放。
  */
 export async function maybeFullSync(budgetMs = 60_000, opts?: { gapMs?: number; force?: boolean }): Promise<MaybeFullSyncResult> {
   const empty: MaybeFullSyncResult = { added: 0, attempted: false, ok: [] }
   const anyLogin = taobaoHasLogin() || jdHasLogin() || pddHasLogin() || fcHasLogin() || miHasLogin()
   if (!anyLogin) return empty
-
-  const lockMs = 20_000
-  const lastStart = Number(readJsonFile(FULL_LOCK_FILE())?.at ?? 0) || 0
-  if (!opts?.force && Date.now() - lastStart < lockMs) return empty
-  try { writeJsonFile(FULL_LOCK_FILE(), { at: Date.now() }) } catch { }
 
   const before = getPickups().length
   let report: PlatformSyncReport | null = null
