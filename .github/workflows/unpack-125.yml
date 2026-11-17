@@ -1,0 +1,37 @@
+name: unpack-125
+on:
+  push:
+    paths:
+      - "build/release125.b64"
+      - ".github/workflows/unpack-125.yml"
+  workflow_dispatch: {}
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Decode release zip and clean payload
+        run: |
+          set -euo pipefail
+          test -f build/release125.b64
+          mkdir -p releases
+          base64 -d build/release125.b64 > "releases/包裹助手_远程更新_1.2.5.zip"
+          python3 - << 'PY'
+          import hashlib, pathlib
+          p = pathlib.Path("releases/包裹助手_远程更新_1.2.5.zip")
+          h = hashlib.sha256(p.read_bytes()).hexdigest()
+          print("size", p.stat().st_size, "sha256", h)
+          assert p.stat().st_size == 1083706
+          assert h == "06798ae5552012849bd32ee269448462a1b30f23ead58b533a4ee8dcf265f474"
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "releases/包裹助手_远程更新_1.2.5.zip"
+          git rm -f build/release125.b64 .github/workflows/unpack-125.yml || true
+          git status
+          git commit -m "Add 1.2.5 release zip and remove unpack payload"
+          git push
