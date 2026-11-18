@@ -15,7 +15,8 @@ import { safeDelay } from "./safeTimer"
 
 const ARRIVED_RE = /待取件|已到站|已到达|已投递|已暂存|已存放|已放入|已代收|请及时取|请及时领取|凭取件码|待领取|快递柜|驿站|代收点/
 
-/** 统一补充取件码与到站标记 */
+export type TrackUpdateMap = Map<string, any>
+
 function enrichTrackUpdate(u: any, latestText: string, nodes?: any[], pkg?: any): any {
   const cleanLatest = String(latestText || "").replace(/\s+/g, " ").trim()
   if (cleanLatest) {
@@ -37,15 +38,13 @@ function enrichTrackUpdate(u: any, latestText: string, nodes?: any[], pkg?: any)
   return u
 }
 
-/** 快递鸟线路：单号查轨迹，返回变化字段 */
-async function refreshViaKdniao(no: string, shipperCode?: string, pkg?: any): Promise<Partial<any> | null> {
+async function refreshViaKdniao(no: string, shipperCode?: string, pkg?: any): Promise<any> {
   if (!no || no.length < 5) return null
   try {
     const r = await queryTracking(no, { shipperCode })
     if (!r) return null
     const latest = String(r.latest || "").replace(/\s+/g, " ").trim()
     const hasNodes = Array.isArray(r.nodes) && r.nodes.length > 0
-    // 如果既没有最新轨迹也没有节点，视为查询未命中，不覆盖旧数据
     if (!latest && !hasNodes) return null
 
     const u: any = {}
@@ -59,10 +58,8 @@ async function refreshViaKdniao(no: string, shipperCode?: string, pkg?: any): Pr
   }
 }
 
-/** 平台线路：查平台包裹最新状态（支持自动纠正 orderId） */
-async function refreshViaPlatform(src: string, passedOrderId: string, pkg: any): Promise<Partial<any> | null> {
+async function refreshViaPlatform(src: string, passedOrderId: string, pkg: any): Promise<any> {
   try {
-    // 修复：widgetTasks 传进来的 passedOrderId 实际上是 pkg.uuid！这里优先取 pkg.orderId
     const realOrderId = String(pkg?.orderId || pkg?.orderSn || passedOrderId || "")
     if (!realOrderId) return null
 
@@ -87,7 +84,6 @@ async function refreshViaPlatform(src: string, passedOrderId: string, pkg: any):
 
     if (!fresh) return null
     const latest = String(fresh.latest || fresh.trackLatest || "").replace(/\s+/g, " ").trim()
-    // 若平台接口在后台未拿到有效轨迹，返回 null 以便触发外层的快递鸟降级查询
     if (!latest && !fresh.mailNo && !fresh.status) return null
 
     const u: any = {
@@ -107,8 +103,8 @@ async function refreshViaPlatform(src: string, passedOrderId: string, pkg: any):
 export async function refreshMailNos(
   items: Array<{ no?: string; orderId?: string; source?: string; shipperCode?: string; pkg?: any }>,
   opts?: { deadline?: number },
-): Promise>> {
-  const out = new Map<string, Partial<any>>()
+): Promise<TrackUpdateMap> {
+  const out = new Map<string, any>()
   const deadline = opts?.deadline ?? Date.now() + 8000
   const timeUp = () => Date.now() > deadline
   const BATCH = 15
@@ -118,18 +114,16 @@ export async function refreshMailNos(
     const batch = items.slice(i, i + BATCH)
     await Promise.all(batch.map(async it => {
       if (timeUp()) return
-      let u: Partial<any> | null = null
+      let u: any = null
       const pkg = it.pkg || {}
       const src = String(it.source || pkg.source || "").toLowerCase()
       const mailNo = String(it.no || pkg.mailNo || "").trim()
       const shipperCode = it.shipperCode || pkg.shipperCode || ""
 
-      // 1. 平台单优先尝试平台自身接口
       if (src === "taobao" || src === "cainiao" || src === "jd" || src === "pdd") {
         u = await refreshViaPlatform(src, String(it.orderId || ""), pkg)
       }
 
-      // 2. 双保险兜底：如果非平台单，或者平台接口在组件后台因无 WebView/Cookie 失败，只要有运单号就走快递鸟查询！
       if ((!u || !u.trackLatest) && mailNo) {
         const kdUpdate = await refreshViaKdniao(mailNo, shipperCode, pkg)
         if (kdUpdate) {
@@ -137,7 +131,6 @@ export async function refreshMailNos(
         }
       }
 
-      // 注意：key 必须严格对齐 widgetTasks.ts 里的 String(p.mailNo || p.uuid || "")
       const mapKey = String(it.no || it.orderId || pkg.mailNo || pkg.uuid || "")
       if (u && mapKey) {
         out.set(mapKey, u)
