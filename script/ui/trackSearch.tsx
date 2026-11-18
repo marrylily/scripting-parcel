@@ -3,8 +3,8 @@
 import { Annotation, Button, Device, HStack, Image, Map, MapPolyline, Marker, NavigationStack, ProgressView, ScrollView, Spacer, Text, TextField, Toolbar, ToolbarItem, UnevenRoundedRectangle, VStack, ZStack, useColorScheme, useObservable, useEffect, useState } from "scripting"
 import { assetImage } from "./assets"
 import { PlatformMark } from "./platformMark"
-import { sourceOf } from "../utils/model"
-import { C, CAPSULE, CLOSED_TINT, GLASS, RR, alpha, companyName, glassFill } from "../theme"
+import { isReturningText, sourceOf } from "../utils/model"
+import { C, CAPSULE, CLOSED_TINT, GLASS, RR, alpha, companyName, companyCode, glassFill } from "../theme"
 // 顶部两角圆角、底部直角的面板形状
 const TOP_PANEL = { type: "rect" as const, cornerRadii: { topLeading: 26, topTrailing: 26, bottomLeading: 0, bottomTrailing: 0 }, style: "continuous" as const }
 // 面板顶边压住地图的高度：圆角两侧透出地图
@@ -17,7 +17,8 @@ import { notify } from "./notify"
 import { CompanyLogo } from "./PickupRow"
 import { notifyArrived } from "../utils/reminders"
 import { arrivedAtOf } from "../utils/arrive"
-import { addPickup, arrivalState, getPickups, matchStation, updatePickup, type Pickup } from "../store"
+import { addPickup, arrivalState, findDuplicatePickup, getPickups, matchStation, updatePickup, type Pickup } from "../store"
+import { refreshOnePickup } from "../utils/platformSync"
 import {
   clearTrackHistory, companyIndex, extractPickupCode, getCodeFor, getPhoneFor, loadTrackHistory, pushTrackHistory,
   queryTracking, removeTrackHistory, saveCodeFor, savePhoneFor, statusLabel,
@@ -26,7 +27,6 @@ import {
 import { trackMailNo } from "../utils/cainiao"
 import { pddTrack } from "../utils/pddExpress"
 import { pddHasLogin } from "../utils/pdd"
-import { safeTimeoutRace, tryScheduleTimeout } from "../utils/safeTimer"
 
 type Closer = () => void
 
@@ -130,7 +130,8 @@ export function TrackSearchSheet({ close, bump }: { close: Closer; bump: Closer 
     // 运单号不是取件码：没识别到真码就留空，界面上单独显示运单号
     const pickedCode = found && codeKey(found) !== codeKey(n) ? found : ""
     const eta = etaInText(res.latest ?? "")
-    const exist = getPickups().find(p => (p.mailNo ?? p.code) === n)
+    // 同一运单号绝不建第二张卡：按 codeKey 归一化比对（平台可能给的是小写/带连字符的写法）
+    const exist = findDuplicatePickup(getPickups(), { mailNo: n })
 
     if (!exist) {
       const created = addPickup({
@@ -501,7 +502,10 @@ async function roadBetween(a: Pt, b: Pt): Promise<LatLng[]> {
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${a.longitude},${a.latitude};${b.longitude},${b.latitude}?geometries=geojson&overview=simplified`
     // fetch 不带超时会一直挂着（不报错），外面就一直画不出线
-    const r = await safeTimeoutRace(fetch(url), 3500, "timeout") as any
+    const r = await Promise.race([
+      fetch(url),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500)),
+    ]) as any
     const j: any = await r.json()
     const coords: number[][] = j?.routes?.[0]?.geometry?.coordinates ?? []
     if (coords.length < 2) throw new Error("no route")
@@ -616,15 +620,44 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
     } finally { setRouting(false) }
   }
 
+  /** 查到的新轨迹统一走这里：先上界面，再写回包裹（不写回的话详情页是新的、退出去卡片还是旧的） */
+  function applyTrace(r: TrackResult) {
+    setRes(r)
+    setNeedPhone(false)
+    const cn = companyCode(r.company || "")
+    if (pkg.uuid && pkg.uuid !== "preview" && (r.nodes?.length ?? 0) > 0) {
+      updatePickup(pkg.uuid, {
+        trackLatest: r.latest,
+        trackNodes: r.nodes,
+        trackUpdatedAt: Date.now(),
+        trackCompany: r.company || pkg.trackCompany,
+        ...(cn > 0 && cn !== pkg.companyName ? { companyName: cn } : {}),
+      })
+    }
+    void buildRoute(r)
+  }
+
+  /** 手动查单这条路：先菜鸟（免登录、不用凭证），没节点才问快递鸟。
+   *  跟「认快递公司」是同一个顺序，两边不要各写一套。 */
+  async function traceByMailNo(withPhone = phone): Promise<TrackResult> {
+    const cn = await trackMailNo(mailNo).catch(() => null)
+    const nodes = cn?.nodes ?? []
+    if (nodes.length > 0) {
+      const latest = nodes[0].text
+      return {
+        shipperCode: "", company: cn?.company ?? "",
+        state: "",
+        status: (/签收|已送达|已取件|已投递/.test(latest) ? "delivered" : "transit") as TrackResult["status"],
+        latest, nodes,
+      } as TrackResult
+    }
+    return await queryTracking(mailNo, { shipperCode: pkg.shipperCode, phone: withPhone })
+  }
+
   async function load(withPhone = phone) {
-    // 平台授权的包裹只用平台同步的轨迹，不走快递鸟查询
-    if (isPlatform) { setBusy(false); return }
     setBusy(true); setMsg("")
     try {
-      const r = await queryTracking(mailNo, { shipperCode: pkg.shipperCode, phone: withPhone })
-      setRes(r)
-      setNeedPhone(false)
-      void buildRoute(r)
+      applyTrace(await traceByMailNo(withPhone))
     } catch (e: any) {
       if (e?.needPhone) {
         setNeedPhone(true)
@@ -637,8 +670,27 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
 
   useEffect(() => {
     if (res && (res.nodes?.length ?? 0) > 0) void buildRoute(res)
-    // 每次进详情都拉一次最新物流（先显示已有缓存，再替换成新结果）；
-    // 要手机尾号时直接弹窗，不重复请求
+    // 点开就刷。顺序：包裹当初从哪个平台抓的就先刷那个平台；平台拿不到数据，
+    // 才退回「手动导入」那套（菜鸟 → 快递鸟）。
+    if (pkg.source && pkg.source !== "kdniao") {
+      setBusy(true)
+      void refreshOnePickup(pkg.uuid)
+        .then(async ok => {
+          const fresh = ok ? getPickups().find(x => x.uuid === pkg.uuid) : null
+          if (fresh && (fresh.trackNodes?.length ?? 0) > 0) {
+            setRes({
+              shipperCode: fresh.shipperCode ?? "", company: fresh.trackCompany ?? "",
+              state: "", status: (fresh.status === 2 ? "delivered" : "transit") as TrackResult["status"],
+              latest: fresh.trackLatest ?? "", nodes: fresh.trackNodes,
+            } as TrackResult)
+            return
+          }
+          if (!needPhoneOnOpen) await load().catch(() => { })
+        })
+        .finally(() => setBusy(false))
+      return
+    }
+    // 手动导入/快递鸟的包裹：先显缓存，再去拉最新（要手机尾号时直接弹窗，不重复请求）
     if (!needPhoneOnOpen) void load()
   }, [])
 
@@ -726,13 +778,13 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
       const { fcOpenBox } = await import("../utils/fengchao")
       await fcOpenBox(box)
       setOpenMsg("柜门已开，请取件")
-      tryScheduleTimeout(() => setOpenMsg(""), 6000)
+      setTimeout(() => setOpenMsg(""), 6000)
     } catch (e: any) {
       const text = String(e?.message ?? e)
       setOpenFailed(true)
       // 文案太长就截断，气泡本身不限行数但别挡住地图
       setOpenMsg(text.length > 40 ? text.slice(0, 40) + "…" : text)
-      tryScheduleTimeout(() => { setOpenMsg(""); setOpenFailed(false) }, 8000)
+      setTimeout(() => { setOpenMsg(""); setOpenFailed(false) }, 8000)
     } finally {
       OPENING.delete(key)
       setOpening(false)
@@ -869,7 +921,7 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
                   <Button action={() => {
                     void Pasteboard.setString(mailNo)
                     setCopied(true)
-                    tryScheduleTimeout(() => setCopied(false), 1200)
+                    setTimeout(() => setCopied(false), 1200)
                   }}>
                     <Text font={12} foregroundStyle={C.accent}>{copied ? "已复制" : "复制"}</Text>
                   </Button>
@@ -924,7 +976,7 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
                     <Text font={12} foregroundStyle={C.secondary}>{pkg.courierStationName}</Text>
                   ) : null}
                 </VStack>
-                <Icon name="xmark.circle.fill" size={20} color={CLOSED_TINT} />
+                <Icon name={isReturningText(closedLabel, pkg?.trackLatest) ? "shippingbox.and.arrow.backward" : "xmark.circle.fill"} size={20} color={CLOSED_TINT} />
               </HStack>
             ) : pickupCode ? (
               <HStack spacing={10} frame={{ maxWidth: "infinity" }} padding={{ top: 16 }}>
@@ -943,7 +995,7 @@ export function TrackDetailPage({ pkg, close, initial, standalone, onAdd, needPh
                 <Button action={() => {
                   void Pasteboard.setString(pickupCode)
                   setCopiedCode(true)
-                  tryScheduleTimeout(() => setCopiedCode(false), 1200)
+                  setTimeout(() => setCopiedCode(false), 1200)
                 }}>
                   <HStack spacing={4} padding={{ horizontal: 11, vertical: 7 }} contentShape="rect"
                     background={{ style: C.track, shape: CAPSULE }}>

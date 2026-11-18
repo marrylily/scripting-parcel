@@ -1,10 +1,10 @@
 // 包裹助手 — 数据层
 import { Widget } from "scripting"
-import { companyName } from "./theme"
+import { companyName, companyCode, companyCodeInText } from "./theme"
 import { syncLogosToShared } from "./utils/widgetLogos"
 import { matchStationIn as matchStationInPure } from "./utils/stationMatch"
 import { readJsonFile, writeJsonFile, operationFiles } from "./utils/sharedJson"
-import { tryScheduleTimeout } from "./utils/safeTimer"
+import { codeKey } from "./utils/codes"
 // 数据模型字段与原 Pickup 一一对应（取件码/公司/地址/手机号/备注/状态/短信/驿站）。
 // 数据只存本机 Storage，不访问任何自建服务器。
 
@@ -40,7 +40,7 @@ export interface Pickup {
   trackNodes?: { time: string; text: string }[]
   trackUpdatedAt?: number
   /** 数据来源：手动查快递走快递鸟；平台授权走对应平台，刷新时各走各的 */
-  source?: "kdniao" | "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
+  source?: "kdniao" | "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao" | "vip" | "dewu"
   /** 收货城市 / 完整收货地址（平台同步或轨迹里解析，用来在地图上画收货点） */
   receiverCity?: string
   receiverAddress?: string
@@ -82,6 +82,8 @@ export interface CourierStation {
   keywords?: string[]
   /** 手机号可以有多个（同一个驿站可能有好几个联系电话） */
   phones?: string[]
+  /** 是否在取件页的驿站标题下面显示营业时间与地址（默认不显示） */
+  showOnHome?: boolean
 }
 
 export interface BindUser {
@@ -117,8 +119,7 @@ export interface Settings {
   refreshWidgetMin: number
   /** 组件重建时，距上次刷新「已有单号」多久才真的联网（分钟） */
   refreshExistingMin: number
-  /** 组件全量轮转节拍：每隔这么久查一个平台的新订单（分钟） */
-  fullRotateMin: number
+  /** 全量同步间隔（小时）：App 与组件的全量轮转都用它 */
   fullSyncHours: number
   failCoolMin: number
   // 身份码
@@ -338,18 +339,23 @@ export function applyWidgetNewPackages(): number {
   if (files.length === 0) return applyWidgetNewPackagesLegacy()
   const list = getPickups()
   const keyOf = (p: any) => `${p?.source ?? ""}|${String(p?.orderId ?? "") || String(p?.mailNo ?? "")}`
+  // 运单号必须归一化比较：平台和组件两边的写法可能差大小写/空格，直接 === 会各建一张卡
+  const mailKeyOf = (p: any) => codeKey(String(p?.mailNo ?? ""))
   const keys = new Set(list.map(keyOf))
-  const mails = new Set(list.map(p => String(p.mailNo || "")).filter(Boolean))
+  const mails = new Set(list.map(mailKeyOf).filter(Boolean))
   const next = [...list]
   const done: string[] = []
   for (const file of files) {
     const raw = readJsonFile<any>(file, null)
     if (!raw || typeof raw !== "object") { done.push(file); continue }
     const k = keyOf(raw)
-    if (keys.has(k) || (raw.mailNo && mails.has(String(raw.mailNo)))) { done.push(file); continue }
+    if (keys.has(k) || (raw.mailNo && mails.has(mailKeyOf(raw)))) { done.push(file); continue }
+    // 用户删过的单：组件不知道，但这里不能再加回去
+    if (isPickupRemoved(raw)) { done.push(file); continue }
     const item: Pickup = { ...raw, uuid: raw.uuid || uuid(), type: raw.type ?? "delivery", createdAt: Number(raw.createdAt) || Date.now(), codeTime: raw.codeTime ?? nowText() }
     keys.add(k)
-    if (item.mailNo) mails.add(String(item.mailNo))
+    const mk = mailKeyOf(item)
+    if (mk) mails.add(mk)
     next.unshift(item)
     done.push(file)
   }
@@ -365,15 +371,17 @@ function applyWidgetNewPackagesLegacy(): number {
     if (!Array.isArray(arr) || arr.length === 0) return 0
     const list = getPickups()
     const keyOf = (p: any) => `${p?.source ?? ""}|${String(p?.orderId ?? "") || String(p?.mailNo ?? "")}`
+    const mailKeyOf = (p: any) => codeKey(String(p?.mailNo ?? ""))
     const keys = new Set(list.map(keyOf))
-    const mails = new Set(list.map(p => String(p.mailNo || "")).filter(Boolean))
+    const mails = new Set(list.map(mailKeyOf).filter(Boolean))
     const next = [...list]
     let n = 0
     for (const raw of arr) {
       if (!raw || typeof raw !== "object") continue
       const k = keyOf(raw)
       if (keys.has(k)) continue
-      if (raw.mailNo && mails.has(String(raw.mailNo))) continue
+      if (raw.mailNo && mails.has(mailKeyOf(raw))) continue
+      if (isPickupRemoved(raw)) continue
       const item: Pickup = {
         ...raw,
         uuid: raw.uuid || uuid(),
@@ -382,7 +390,8 @@ function applyWidgetNewPackagesLegacy(): number {
         codeTime: raw.codeTime ?? nowText(),
       }
       keys.add(k)
-      if (item.mailNo) mails.add(String(item.mailNo))
+      const mk = mailKeyOf(item)
+      if (mk) mails.add(mk)
       next.unshift(item)
       n++
     }
@@ -405,7 +414,7 @@ function applyWidgetTrackUpdatesLegacy(): number {
     if (!FileManager.existsSync(SHARED_TRACK)) return 0
     const parsed = JSON.parse(FileManager.readAsStringSync(SHARED_TRACK) || "{}") || {}
     // 只允许组件写物流字段：归属、已取、用户备注这类不能让它改
-    const allowed = ["trackLatest", "trackNodes", "trackUpdatedAt", "code", "codes", "arrivedAt", "mailNo", "itemTitle", "status"] as const
+    const allowed = ["trackLatest", "trackNodes", "trackUpdatedAt", "code", "codes", "arrivedAt", "mailNo", "itemTitle", "status", "pickedAt", "courierStationName", "courierStationUuid", "address", "fcBox", "closed"] as const
     let n = 0
     const next = getPickups().map(p => {
       const u = (parsed as any)[p.uuid]
@@ -429,7 +438,7 @@ function applyWidgetTrackUpdatesLegacy(): number {
 export function applyWidgetTrackUpdates(): number {
   const files = operationFiles(`${SHARED_DIR}/ops/track`)
   if (files.length === 0) return applyWidgetTrackUpdatesLegacy()
-  const allowed = ["trackLatest", "trackNodes", "trackUpdatedAt", "code", "codes", "arrivedAt", "mailNo", "itemTitle", "status"] as const
+  const allowed = ["trackLatest", "trackNodes", "trackUpdatedAt", "code", "codes", "arrivedAt", "mailNo", "itemTitle", "status", "pickedAt", "courierStationName", "courierStationUuid", "address", "fcBox", "closed"] as const
   let next = getPickups(), n = 0
   const done: string[] = []
   for (const file of files) {
@@ -453,16 +462,105 @@ export function applyWidgetTrackUpdates(): number {
 }
 
 export function addPickup(input: Omit<Pickup, "uuid" | "createdAt" | "codeTime"> & { codeTime?: string }): Pickup {
+  const list = getPickups()
+  // 同一运单号 / 订单号绝不建第二张卡：平台同步、手动添加、快捷指令、小组件合并全走这里，
+  // 任何一处漏判都只能在入库前拦，不能事后靠清理。
+  const dup = findDuplicatePickup(list, input)
+  if (dup) return dup
+  // 用户主动加回来的单：撤销「删除记忆」，否则它下一轮同步还是进不来
+  unmarkPickupRemoved(input)
   const item: Pickup = {
     ...input,
     uuid: uuid(),
     codeTime: input.codeTime ?? nowText(),
     createdAt: Date.now(),
   }
-  const list = getPickups()
   list.unshift(item)
   savePickups(list)
   return item
+}
+
+/** 判断这条输入是不是已经在列表里了。运单号按 codeKey 归一化比较
+ *  （大小写/空格/连字符各不相同：SF123 vs sf-123），再看平台订单号。 */
+export function findDuplicatePickup(
+  list: Pickup[],
+  input: { mailNo?: string; orderId?: string },
+): Pickup | undefined {
+  const mail = codeKey(input.mailNo ?? "")
+  if (mail) {
+    const hit = list.find(p => p.mailNo && codeKey(p.mailNo) === mail)
+    if (hit) return hit
+  }
+  const oid = String(input.orderId ?? "")
+  if (oid) return list.find(p => p.orderId && String(p.orderId) === oid)
+  return undefined
+}
+
+/* ---------------- 删除记忆（墓磑） ----------------
+ * 用户手动删掉的包裹，平台下一轮同步不能又导回来（否则删除没意义）。
+ * 按运单号 + 订单号记一份黑名单；只有「清除缓存」会清空它。
+ * 用户主动重新加入同一单时，addPickup 会把对应的 key 撤掉。 */
+const K_REMOVED = "cc.removed"
+
+type RemovedMap = Record<string, number>
+
+function removedMap(): RemovedMap {
+  try {
+    const v = Storage.get<RemovedMap>(K_REMOVED)
+    return v && typeof v === "object" ? v : {}
+  } catch { return {} }
+}
+
+function removedKeysOf(p: { mailNo?: string; orderId?: string }): string[] {
+  const out: string[] = []
+  const mail = codeKey(String(p?.mailNo ?? ""))
+  if (mail) out.push(`m:${mail}`)
+  const oid = String(p?.orderId ?? "")
+  if (oid) out.push(`o:${oid}`)
+  return out
+}
+
+/** 删除时记一笔；不无上限涨，只留最近 2000 条 */
+export function markPickupRemoved(p: { mailNo?: string; orderId?: string }): void {
+  const keys = removedKeysOf(p)
+  if (keys.length === 0) return
+  const map = removedMap()
+  const at = Date.now()
+  for (const k of keys) map[k] = at
+  const kept = Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, 2000)
+  try { Storage.set(K_REMOVED, Object.fromEntries(kept)) } catch { }
+}
+
+/** 这一单是不是被用户删过（平台同步/组件合并都要先问一句） */
+export function isPickupRemoved(p: { mailNo?: string; orderId?: string }): boolean {
+  const keys = removedKeysOf(p)
+  if (keys.length === 0) return false
+  const map = removedMap()
+  return keys.some(k => (map[k] ?? 0) > 0)
+}
+
+/** 用户主动把同一单加回来了：撤销删除记忆 */
+export function unmarkPickupRemoved(p: { mailNo?: string; orderId?: string }): void {
+  const keys = removedKeysOf(p)
+  if (keys.length === 0) return
+  const map = removedMap()
+  let changed = false
+  for (const k of keys) {
+    if (k in map) { delete map[k]; changed = true }
+  }
+  if (changed) { try { Storage.set(K_REMOVED, map) } catch { } }
+}
+
+/** 清除缓存时把这份名单清空（用户要求：只有清缓存才忘） */
+export function clearRemovedPickups(): number {
+  const n = removedPickupCount()
+  try { Storage.remove(K_REMOVED) } catch { }
+  return n
+}
+
+/** 黑名单里现在记了多少条（清除缓存的预览/文案用） */
+export function removedPickupCount(): number {
+  return Object.keys(removedMap()).length
 }
 
 export function updatePickup(uuid: string, patch: Partial<Pickup>) {
@@ -472,6 +570,8 @@ export function updatePickup(uuid: string, patch: Partial<Pickup>) {
 export function deletePickup(uuid: string) {
   const gone = getPickups().find((p) => p.uuid === uuid)
   savePickups(getPickups().filter((p) => p.uuid !== uuid))
+  // 记住「用户删过它」：否则下一轮平台同步会把同一单又导进来，删除等于白删
+  if (gone) markPickupRemoved(gone)
   // 删掉的包裹不能继续弹「已放置 N 小时」：把它的到站记录与待投递提醒一并清掉。
   // 常态刷新也能清，但要等下一轮（限频 20 分钟），中间到点就会弹出来。
   void import("./utils/reminders").then((m) => {
@@ -525,6 +625,40 @@ export function normalizeCodes(): number {
   return changed
 }
 
+/** 这条包裹是自动导入的（平台同步 / 快捷指令），不是用户手选的 */
+function autoImported(p: Pickup): boolean {
+  // 快递鸟那条路的公司名来自 ShipperCode，可靠，不动
+  if (p.source && p.source !== "kdniao") return true
+  return /^(tb|jd|pdd|cn|fc|mi|manual):/i.test(p.orderId ?? "")
+}
+
+/** 一次性修「所有包裹都被写成中通」的老数据：
+ *  以前平台同步新单用 `idx || 1`（认不出公司就写 1）、快捷指令导入直接写 1，
+ *  而 1 就是中通快递——于是全部包裹都顶着中通图标。
+ *  修法：能从文案/轨迹/公司名里认出就用认出的；认不出且原来记的就是中通、
+ *  文案里也没提中通 → 那是当初兜底写进去的，改回 0（其他快递）。
+ *  已经认得出公司的（非 0/1）一律不信文案，避免驿站名把快递公司改错。 */
+export function repairCompanyCodes(): number {
+  if (Storage.get<boolean>("cc.company.fix1")) return 0
+  try { Storage.set("cc.company.fix1", true) } catch { }
+  let changed = 0
+  const next = getPickups().map(p => {
+    const code = Number(p.companyName ?? 0) || 0
+    if (code !== 0 && code !== 1) return p
+    const text = [p.smsContent, p.notes, p.trackLatest, p.itemTitle,
+      ...(p.trackNodes ?? []).map(n => n.text)].filter(Boolean).join("\n")
+    const fromText = companyCodeInText(text)
+    let want = code
+    if (fromText && fromText !== code) want = fromText
+    else if (code === 1 && !fromText && companyCode(p.trackCompany ?? "") !== 1 && autoImported(p)) want = 0
+    if (want === code) return p
+    changed++
+    return { ...p, companyName: want }
+  })
+  if (changed > 0) savePickups(next)
+  return changed
+}
+
 export function setPickupStatus(uuid: string, status: PickupStatus) {
   // 手动标记状态时记下用户意图：已取件的包裹后续同步不再被物流状态拉回待取。
   // 同时记下取件时间：卡片/历史要显示「取件 X月X日」，不能拿入库时间充数。
@@ -545,17 +679,13 @@ export function setPickupStatus(uuid: string, status: PickupStatus) {
 }
 
 /** 取件页/小组件改完状态都要让对面立刻重画，保证两边永远同源同结果 */
-let widgetSyncTimer: any = null
+let widgetSyncTimer: ReturnType<typeof setTimeout> | null = null
 function syncWidget(delay = 600) {
   if (widgetSyncTimer) return
-  const { id, scheduled } = tryScheduleTimeout(() => {
+  widgetSyncTimer = setTimeout(() => {
     widgetSyncTimer = null
     try { Widget.reloadAll() } catch { }
   }, delay)
-  if (scheduled) widgetSyncTimer = id
-  else {
-    try { Widget.reloadAll() } catch { }
-  }
 }
 
 // ---------- 驿站 ----------
@@ -730,8 +860,8 @@ const DEFAULT_SETTINGS: Settings = {
   simpleMode: false,
   refreshAppMin: 20,
   refreshWidgetMin: 5,
-  refreshExistingMin: 10,
-  fullRotateMin: 15,
+  // 组件补单与 App 前台补单同节拍：20 分钟
+  refreshExistingMin: 20,
   fullSyncHours: 3,
   failCoolMin: 30,
   showTaobao: true,
@@ -754,22 +884,18 @@ export function getSettings(): Settings {
   const merged = { ...DEFAULT_SETTINGS, ...(v ?? {}) }
   // 旧版本允许选「5 分钟 / 30 秒」，现在最短 10 分钟（与组件重建间隔同起点）
   if (!LIVE_EXPIRY_OPTIONS.includes(merged.liveExpiryCourier)) merged.liveExpiryCourier = "10分钟"
-  // 一次性重置小组件三个节拍到新的倍数关系（重建 5 / 数据 10 / 全量 15）
+  // 小组件跟随 App 节拍：补单 = App 补单间隔，全量轮转 = fullSyncHours
   try {
-    if (!Storage.get<boolean>("cc.schedule.v2")) {
-      merged.refreshWidgetMin = 5
-      merged.refreshExistingMin = 10
-      merged.fullRotateMin = 15
-      Storage.set("cc.schedule.v2", true)
+    if (!Storage.get<boolean>("cc.schedule.v3")) {
+      merged.refreshExistingMin = 20
+      Storage.set("cc.schedule.v3", true)
     }
   } catch { }
-  // 倍数约束：数据刷新 ≥ 2×重建；全量轮转 ≥ 3×重建且严格大于数据刷新
+  // 倍数约束：数据刷新 ≥ 2×重建
   const r = Math.max(5, Math.min(180, Number(merged.refreshWidgetMin) || 5))
   const e = Math.max(Math.max(5, Math.min(120, Number(merged.refreshExistingMin) || r * 2)), r * 2)
-  const f0 = Math.max(Math.max(10, Math.min(240, Number(merged.fullRotateMin) || r * 3)), r * 3)
   merged.refreshWidgetMin = r
   merged.refreshExistingMin = e
-  merged.fullRotateMin = f0 <= e ? e * 2 : f0
   return merged
 }
 

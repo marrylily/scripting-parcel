@@ -329,20 +329,68 @@ export function courierSymbol(code: number | null | undefined): CourierSymbol {
   }
 }
 
+const COMPANY_EXACT: Record<string, number> = {
+  "中通快递": 1, "中通": 1, "顺丰速运": 2, "顺丰": 2,
+  "圆通速递": 3, "圆通": 3, "韵达快递": 4, "韵达": 4, "申通快递": 5, "申通": 5,
+  "极兔速递": 6, "极兔": 6, "邮政快递": 7, "邮政": 7, "中国邮政": 7,
+  "京东物流": 8, "京东": 8, "德邦快递": 9, "德邦": 9,
+  "丰巢": 10, "丰巢柜": 10, "菜鸟驿站": 11, "菜鸟": 11,
+  "百世快递": 12, "百世": 12, "天天快递": 13, "天天": 13,
+  "宅急送": 14, "苏宁物流": 15, "苏宁": 15,
+  "DHL": 16, "dhl": 16, "联邦快递": 17, "FedEx": 17, "fedex": 17,
+  "UPS": 18, "ups": 18, "达达快送": 19, "达达": 19,
+  "闪送": 20, "顺丰同城": 21,
+}
+
+/** 名称里带这些词就算这家：平台给的写法五花八门（「中通速递」「圆通快递」「EMS」「邮政快递包裹」）。
+ *  顺序有意义：顺丰同城要排在顺丰前，中通/圆通这种短词互相不撞。 */
+const COMPANY_ALIAS: [RegExp, number][] = [
+  [/顺丰同城/, 21],
+  [/顺丰|丰网|shunfeng|SF\s*Express/i, 2],
+  [/中通|zhongtong|ZTO/i, 1],
+  [/圆通|yuantong|YTO/i, 3],
+  [/韵达|yunda/i, 4],
+  [/申通|shentong|STO/i, 5],
+  [/极兔|J&T|JT\s*Express/i, 6],
+  [/邮政|中邮|EMS|YZPY/i, 7],
+  [/京东|京广|JDL/i, 8],
+  [/德邦|deppon|DBWL/i, 9],
+  [/丰巢|Hive\s*Box/i, 10],
+  [/菜鸟|丹鸟|CAINIAO/i, 11],
+  [/百世|HTKY/i, 12],
+  [/天天快递|TTKDEX/i, 13],
+  [/宅急送|ZJS/i, 14],
+  [/苏宁/i, 15],
+  [/DHL/i, 16],
+  [/联邦|FedEx/i, 17],
+  [/\bUPS\b/, 18],
+  [/达达/, 19],
+  [/闪送/i, 20],
+]
+
+/** 名称 → 编号。认不出返回 0（「其他快递」），绝不要默认成某一家：
+ *  以前平台同步写的是 `idx || 1`，公司名认不出就全变成中通，桌面上 50 个包裹全顶着中通图标。 */
 export function companyCode(name: string): number {
-  const m: Record<string, number> = {
-    "中通快递": 1, "中通": 1, "顺丰速运": 2, "顺丰": 2,
-    "圆通速递": 3, "圆通": 3, "韵达快递": 4, "韵达": 4, "申通快递": 5, "申通": 5,
-    "极兔速递": 6, "极兔": 6, "邮政快递": 7, "邮政": 7, "中国邮政": 7,
-    "京东物流": 8, "京东": 8, "德邦快递": 9, "德邦": 9,
-    "丰巢": 10, "丰巢柜": 10, "菜鸟驿站": 11, "菜鸟": 11,
-    "百世快递": 12, "百世": 12, "天天快递": 13, "天天": 13,
-    "宅急送": 14, "苏宁物流": 15, "苏宁": 15,
-    "DHL": 16, "dhl": 16, "联邦快递": 17, "FedEx": 17, "fedex": 17,
-    "UPS": 18, "ups": 18, "达达快送": 19, "达达": 19,
-    "闪送": 20, "顺丰同城": 21,
+  const t = String(name ?? "").trim()
+  if (!t) return 0
+  const exact = COMPANY_EXACT[t]
+  if (exact) return exact
+  for (const [re, code] of COMPANY_ALIAS) if (re.test(t)) return code
+  return 0
+}
+
+/** 从一段长文案里认公司：取最早出现的那家（轨迹里公司名一般在前面，
+ *  后面的「菜鸟驿站」是收货点，不能把整条归给菜鸟）。 */
+export function companyCodeInText(text: string): number {
+  const t = String(text ?? "")
+  if (!t) return 0
+  let best = 0
+  let at = Infinity
+  for (const [re, code] of COMPANY_ALIAS) {
+    const m = t.match(re)
+    if (m && m.index != null && m.index < at) { best = code; at = m.index }
   }
-  return m[name] ?? 0
+  return best
 }
 
 

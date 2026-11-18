@@ -1,5 +1,5 @@
 // 取件主页 —— 对齐真机：大标题 + 右上「+」/ 待取·累计取件 / 其他驿站卡片 / 所有取件码 / 右下身份码
-import { Button, HStack, ScrollView, Spacer, Text, VStack, useState } from "scripting"
+import { Button, Device, HStack, ScrollView, Spacer, Text, VStack, useState } from "scripting"
 import { C, CAPSULE, CLOSED_TINT, GLASS, glassFill, RR } from "../theme"
 import { BigTitle, FloatingActions, Icon, Screen, StatCard, type FloatingItem } from "./kit"
 import { CompanyLogo, PickupRow, pickupCompanyLabel } from "./PickupRow"
@@ -38,7 +38,7 @@ function pairRows<T>(arr: T[]): T[][] {
   return rows
 }
 
-export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIdentity, onAll, onExit, onChanged, onSimpleModeChanged, onStationTap, onRefresh }: {
+export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIdentity, onAll, onExit, onChanged, onSimpleModeChanged, onStationTap }: {
   revision: number
   onAdd: () => void
   onEdit: (p: Pickup) => void
@@ -49,7 +49,6 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
   onChanged: () => void
   onSimpleModeChanged?: () => void
   onStationTap?: (name: string) => void
-  onRefresh?: () => Promise<void>
 }) {
   const [identityMenu, setIdentityMenu] = useState(false)
   const [statMode, setStatMode] = useState<"total" | "month">("total")
@@ -86,6 +85,14 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
     groups.set(key, arr)
   }
   const stationGroups = [...groups.entries()].sort((a, b) => (a[0] === "其他驿站" ? 1 : 0) - (b[0] === "其他驿站" ? 1 : 0))
+  // 驿站详情里打开了「显示营业时间与地址」的，标题下面补两行小字（只填了哪项就显哪项）
+  const homeInfo = new Map<string, { hours: string; addr: string }>()
+  for (const st of stations) {
+    if (st.showOnHome !== true) continue
+    const hours = (st.businessHours ?? "").replace(/,\s*/g, " · ").trim()
+    const addr = (st.address ?? "").trim()
+    if (hours || addr) homeInfo.set(st.courierStationName, { hours, addr })
+  }
   const simpleMode = getSettings().simpleMode
 
   // 三条身份码全部关闭时，首页不再显示身份码入口（仍可到设置里重新开启）。
@@ -107,8 +114,7 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
   return (
     <Screen margin={20} exitAction={onExit} actions={<FloatingActions items={actions} />}>
       <ScrollView navigationTitle="" navigationBarTitleDisplayMode="inline" scrollIndicator="never"
-        toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}
-        refreshable={onRefresh}>
+        toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}>
         <VStack alignment="leading" spacing={0} frame={{ maxWidth: "infinity", alignment: "leading" }}
           padding={{ top: 4, bottom: simpleMode ? 12 : 170 }}>
 
@@ -123,14 +129,38 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
               onTap={() => setStatMode(m => (m === "total" ? "month" : "total"))} />
           </HStack>
 
-          {stationGroups.map(([name, items]) => (
-            <VStack key={name} spacing={0} frame={{ maxWidth: "infinity", alignment: "leading" }} padding={{ top: 26 }}>
+          {/* 空状态：放在可视区正中（标题+统计卡以下、底栏以上） */}
+          {pending.length === 0 ? (
+            <VStack spacing={10} frame={{ maxWidth: "infinity", minHeight: Math.max(260, Device.screen.height - 400) }}>
+              <Icon name="shippingbox" size={44} color={C.tertiary} />
+              <Text font={17} foregroundStyle={C.secondary}>暂无待取包裹</Text>
+              <Text font={13} foregroundStyle={C.tertiary} multilineTextAlignment="center">授权电商平台后会自动同步，到站后出现在这里</Text>
+            </VStack>
+          ) : null}
+
+          {stationGroups.map(([name, items]) => {
+            const info = homeInfo.get(name)
+            return (
+            <VStack key={name} spacing={0} frame={{ maxWidth: "infinity", alignment: "leading" }} padding={{ top: 18 }}>
               <HStack spacing={6} frame={{ maxWidth: "infinity" }} padding={{ bottom: 12 }}>
-                <Text font={22} fontWeight="bold" foregroundStyle={C.text} lineLimit={1} minScaleFactor={0.7}
-                  layoutPriority={1} contentShape="rect"
+                <Text font={22} fontWeight="bold" foregroundStyle={C.text} lineLimit={1} minScaleFactor={0.75}
+                  truncationMode="tail" layoutPriority={1} contentShape="rect"
                   onTapGesture={() => { if (name !== "其他驿站") onStationTap?.(name) }}>{name}</Text>
                 <Text font={16} foregroundStyle={C.tertiary} layoutPriority={1}>{`(${items.length})`}</Text>
-                <Spacer />
+                {info ? (
+                  // 名字右侧紧贴着；占满剩余宽度，只在真正放不下时才省略
+                  <VStack alignment="leading" spacing={1} padding={{ leading: 2 }}
+                    frame={{ maxWidth: "infinity", alignment: "leading" }}>
+                    {info.hours ? (
+                      <Text font={11} foregroundStyle={C.tertiary} lineLimit={1} truncationMode="tail">{info.hours}</Text>
+                    ) : null}
+                    {info.addr ? (
+                      <Text font={11} foregroundStyle={C.tertiary} lineLimit={1} truncationMode="tail">{info.addr}</Text>
+                    ) : null}
+                  </VStack>
+                ) : (
+                  <Spacer />
+                )}
                 <VStack frame={{ width: 32, height: 32, alignment: "center" }} contentShape="rect"
                   onTapGesture={() => animate(toggleStationLayout)}>
                   <Icon name={stationLayout === "grid" ? "list.bullet" : "square.grid.2x2"}
@@ -149,7 +179,8 @@ export function PickupTab({ revision, onAdd, onEdit, onIdentityCode, onManageIde
                   onCheck={() => animate(() => { setPickupStatus(p.uuid, 2); onChanged() })} />
               ))}
             </VStack>
-          ))}
+            )
+          })}
 
           {/* 首页不再重复包裹列表：完整列表在「包裹」tab；简洁模式保留预览入口。 */}
           {simpleMode ? (

@@ -2,7 +2,7 @@ import { classify, closedOrderStatus, Pkg, timeOfTrack } from "./model"
 import { normalizePickupCode } from "./codes"
 import { etaInText, etaTimeInText } from "./eta"
 import { diag } from "./net"
-import { safeDelay, pageTimeout } from "./safeTimer"
+import { takeover } from "./webverify"
 
 export const JD_COOKIE_KEY = "jd.cookies"
 
@@ -11,7 +11,13 @@ const SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleW
 
 const LOGIN_URL = "https://plogin.m.jd.com/login/login?appid=0&returnurl=https%3A%2F%2Fhome.m.jd.com%2FmyJd%2Fnewhome.action"
 
-/** 页面加载加超时：实现见 safeTimer（Timer 不可用时不加硬超时，避免抛队列错误） */
+/** 页面加载加超时：京东页会挂很久不报错，不设超时会把整轮同步拖死 */
+function pageTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = (setTimeout as any)(() => reject(new Error("页面超时")), ms)
+    p.then(v => { clearTimeout(t); resolve(v) }, e => { clearTimeout(t); reject(e) })
+  })
+}
 // 京东订单中心首页（my_order_entrance 里点「全部订单」进入全量列表）；
 // 订单列表页 URL 自带 state 参数可直达「待收货」，但拦截判定依赖首页入口元素，保留首页入口再点全部
 const MY_URL = "https://my.m.jd.com/index.html?sceneval=2"
@@ -28,11 +34,13 @@ const TRACK_URL = (o: { orderId: string; skuId?: string; shopId?: string }) =>
  * 京东登录页的 logo/标题区就在这块区域里，输入框贴着它，表现为「显示不全 + 点不到手机号」。
  * 这里用 body 上顶 padding（取真实安全区高度）把整页推下去，并允许页面滚动，键盘弹出也能滚到输入框。
  */
-const JD_LOGIN_FIX = `(function(){
+export const JD_LOGIN_FIX = `(function(){
+  var PAD = 'calc(max(env(safe-area-inset-top, 0px), 116px) + 8px)';
   var CSS = [
     'html,body{height:auto!important;min-height:100%!important;overflow-y:auto!important;',
     '-webkit-overflow-scrolling:touch!important;background:#fff!important;}',
-    'body{padding-top:calc(max(env(safe-area-inset-top, 0px), 96px) + 8px)!important;box-sizing:border-box!important;}',
+    'body{padding-top:' + PAD + '!important;box-sizing:border-box!important;}',
+    'html{scroll-padding-top:116px!important;}',
     '#app,.page{min-height:0!important;}',
     'input{font-size:16px!important;}'
   ].join('');
@@ -41,12 +49,35 @@ const JD_LOGIN_FIX = `(function(){
     if(!st){ st = document.createElement('style'); st.id='agent-jd-fix'; (document.head||document.documentElement).appendChild(st); }
     if(st.textContent !== CSS) st.textContent = CSS;
   }
+  // body 的 padding 推不动 position:fixed 的头部：京东登录页换步骤时头部是 fixed 的，
+  // 在窄屏/安全区小的机型上就会被导航栏整整盖住（别人的截图就是这样）。
+  // fixed/sticky 元素的 margin 仍然生效，给它补同样的高度。
+  function pushPinned(){
+    var all = document.querySelectorAll('body *');
+    var done = 0;
+    for(var i=0;i<all.length && done<40;i++){
+      var el = all[i];
+      if(el.getAttribute('data-cc-pushed') === '1') continue;
+      var cs = getComputedStyle(el);
+      if(cs.position !== 'fixed' && cs.position !== 'sticky') continue;
+      var r = el.getBoundingClientRect();
+      if(r.top > 8 || r.height > 260) continue;
+      el.style.marginTop = PAD;
+      el.setAttribute('data-cc-pushed','1');
+      done++;
+    }
+  }
   apply();
-  var n = 0, iv = setInterval(function(){ apply(); if(++n > 40) clearInterval(iv) }, 300);
+  pushPinned();
+  var n = 0, iv = setInterval(function(){
+    apply();
+    if(n < 20) pushPinned();
+    if(++n > 40) clearInterval(iv);
+  }, 300);
 })()`
 
 declare const fetch: any
-const delay = (ms: number) => safeDelay(ms)
+const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
 
 /* ---------------- 登录态 ---------------- */
 
@@ -106,17 +137,18 @@ async function saveSession(controller: WebViewController): Promise<number> {
   return dedup.length
 }
 
-const hasPtKey = (cookies: any[]) =>
-  (cookies || []).some((c: any) => c && c.name === "pt_key" && !!c.value)
-
 
 /* ---------------- 页面抓取 ---------------- */
 
 async function prepare(controller: WebViewController): Promise<void> {
   try { await controller.setCustomUserAgent(jdUA()) } catch { }
-  // WebView 持久仓库里本来就有登录会话时不要重复注入，否则会产生同名重复 Cookie 反而干扰
-  const existing = await controller.getAllCookies().catch(() => [])
-  if (hasPtKey(existing as any[])) return
+  // 钥匙串里那份是「刚刚登录写下的」，WebView 持久仓库里的可能还是旧的。
+  // 以前这里写的是「仓库里有 pt_key 就整个跳过导入」，于是重新授权后同步还在用旧凭证，
+  // 表现就是「刚登录成功就显示已失效」。现在按值比对：一致就什么都不做，不一致就用钥匙串覆盖。
+  const existing = (await controller.getAllCookies().catch(() => [])) as any[]
+  const storePt = (existing || []).find((c: any) => c && c.name === "pt_key" && c.value)
+  const keyPt = jdCookies().find((c: any) => c && c.name === "pt_key" && c.value)
+  if (storePt && keyPt && String(storePt.value) === String(keyPt.value)) return
   const seen = new Set<string>()
   for (const c of jdCookies()) {
     const k = `${c.name}|${c.domain}`
@@ -330,7 +362,14 @@ export async function jdDiscoverOrders(opts?: { wantHistory?: boolean }): Promis
     const loggedDom = await waitForSelector(controller, ".my_order_entrance", 14000)
     if (!loggedDom) {
       const html = String(await controller.getHTML().catch(() => "") || "")
-      return { orders: [], text: "", html, logged: false, blocked: false }
+      const url = String((controller as any).url || "")
+      // 真失效的判据：被踢到登录页，或页面明确在让你登录。
+      // 不能只拿「14 秒内没出现 .my_order_entrance」当失效——网络慢、验证页、限流页都会命中，
+      // 用户看到的就是「刚登录就失效」。没加载出来/被拦单独算一轮跳过。
+      const onLogin = /plogin|passport\.jd\.com|\/login/i.test(url) || /请登录|登录后查看|账号登录/.test(html)
+      if (onLogin) return { orders: [], text: "", html, logged: false, blocked: false }
+      // 把整页 HTML 当 text 交给上层：人机验证/风控页的正则能命中，提示会准确得多
+      return { orders: [], text: html, html, logged: true, blocked: true }
     }
 
     let orders: JdOrder[] = []
@@ -403,7 +442,7 @@ export async function jdDiscoverOrders(opts?: { wantHistory?: boolean }): Promis
       // 弹窗反而打断用户（用户实测：点个重试也弹窗很烦）
       const humanNeeded = HUMAN_VERIFY_RE.test(text)
       if (attempt === 1 && blocked && humanNeeded) {
-        const ok = await humanVerify(controller, MY_URL)
+        const ok = await humanVerify(MY_URL)
         if (ok) {
           await clickAllOrders(controller)
           await waitForSelector(controller, '[class*="order_state"]', 12000)
@@ -469,29 +508,24 @@ const HUMAN_VERIFY_RE = /快速验证|验证一下|滑动验证|人机验证|安
 
 /**
  * 自动重试不过时把验证页弹给用户：展示 WebView（带着会话 Cookie）让人过滑块，
- * 检测到页面回到正常订单入口自动收起并继续。同登录页交互，最多等 3 分钟。
+ * 检测到页面回到正常订单入口自动收起并继续。超时/关闭/会话回收走统一接管。
  */
-async function humanVerify(controller: WebViewController, url: string): Promise<boolean> {
-  try {
-    await controller.loadURL(url)
-    try { await pageTimeout(controller.waitForLoad(), 15000) } catch { }
-  } catch { }
-  let presented = true
-  const p = controller.present({ fullscreen: true, navigationTitle: "京东需要验证" })
-    .then(() => { presented = false })
-    .catch(() => { presented = false })
-  const deadline = Date.now() + 3 * 60_000
-  let ok = false
-  while (presented && Date.now() < deadline) {
-    await delay(1200)
-    if (!presented) break
+async function humanVerify(url: string): Promise<boolean> {
+  const r = await takeover({
+    key: "jd",
+    title: "京东需要验证",
+    url,
+    cookies: () => jdCookies(),
     // 验证过了 = 订单入口出现（拦截页没有这个元素）
-    if (await waitForSelector(controller, ".my_order_entrance", 800)) { ok = true; break }
-  }
-  if (presented) { try { await controller.dismiss() } catch { } }
-  try { await p } catch { }
-  await delay(400)
-  return ok
+    done: async (c) => {
+      const hit = await c.evaluateJavaScript<boolean>("return !!document.querySelector('.my_order_entrance')")
+      return hit === true || String(hit) === "true"
+    },
+    // 过验证后 pt_key 会换，不存回去下次还是旧的
+    collect: async (c) => { await saveSession(c) },
+  }, { auto: true })
+  if (!r.ok) diag("jd-verify", r)
+  return r.ok
 }
 
 async function clickAllOrders(controller: WebViewController): Promise<void> {
@@ -607,7 +641,7 @@ export function parseTrack(text: string): { mailNo: string; company: string; ite
 function needTrackPage(hint: string): boolean {
   const t = (hint || "").trim()
   if (!t) return true
-  return !/已完成|已取消|已关闭|交易完成|^完成$|退款成功|已退款/.test(t)
+  return !/已完成|已签收|已送达|已收货|已取消|已关闭|交易完成|^完成$|退款成功|已退款/.test(t)
 }
 
 /** 从「【西安市】您的快件已送达 xxx店」这类文案里抠城市与驿站名 */
@@ -650,7 +684,9 @@ export async function jdFetchPackage(order: JdOrder, opts?: { forceTrack?: boole
     } catch { }
   }
 
-  const status = classifyJd(latest)
+  // 状态：节点文案 + 订单列表状态词 + 列表上的配送文案一起看。
+  // 已完成/已签收是强信号，不能被旧节点（停留在「已到达」）盖成在途。
+  const status = classifyJd([latest, order.statusHint, order.delivery].filter(Boolean).join(" "))
   const place = placeOf(latest)
   // 京东的预计时间只在列表卡片文案里（如「预计11月9日发货，11月11日送达」），
   // 有轨迹节点时 latest 会被节点覆盖，所以要在 order.delivery 上也扫一遍。
@@ -695,7 +731,7 @@ function rotateBatch<T>(list: T[], size: number): T[] {
 
 export async function jdSyncAll(
   onProgress?: (done: number, total: number) => void,
-  opts?: { wantHistory?: boolean; deadline?: number },
+  opts?: { wantHistory?: boolean; deadline?: number; maxTargets?: number },
 ): Promise<Pkg[]> {
   const deadline = opts?.deadline ?? Number.POSITIVE_INFINITY
   const { orders, logged, blocked, text } = await jdDiscoverOrders(opts)
@@ -716,7 +752,9 @@ export async function jdSyncAll(
   // 未完成的单优先；最多 12 单（每单一个网页），超出部分下次同步从指针位置继续
   const sorted = [...recent]
     .sort((a, b) => Number(needTrackPage(b.statusHint)) - Number(needTrackPage(a.statusHint)))
-  const targets = rotateBatch(sorted, 12)
+  // 未完成的单优先；最多 12 单（每单一个网页），超出部分下次同步从指针位置继续。
+  // 小组件扩展只有 18 秒预算，实测 12 单要 ~24 秒（包含发现页），所以组件里传 maxTargets=3。
+  const targets = rotateBatch(sorted, Math.max(1, Number(opts?.maxTargets) || 12))
 
   const out: Pkg[] = []
   // 已完成/已关闭的单不再破例开跟踪页（原来的 historyBudget=2）：

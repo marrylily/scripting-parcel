@@ -12,14 +12,14 @@ import { TrackSearchSheet, TrackDetailPage } from "./trackSearch"
 import { syncPickupActivity } from "./live"
 import { refreshTrackedPackages } from "../kdniao"
 import { warmCourierIcons } from "../utils/notifyIcon"
-import { refreshAll, refreshNow } from "../utils/refresh"
+import { refreshAll } from "../utils/refresh"
 import { syncLocationReminders } from "../utils/geo"
 import { dedupePickups } from "../utils/dedupe"
 import { applyPickupCodes } from "../utils/cainiao"
 import { platformEnabled, sanitizeTaobaoAuth } from "../platforms"
-import { applyPddPickupCodes } from "../utils/pddExpress"
+import { importPddStationPackages } from "../utils/pddExpress"
 import { ToastHost } from "./toast"
-import { applyWidgetPicked, applyWidgetTrackUpdates, applyWidgetNewPackages, getPickups, getSettings, normalizeCodes, setPickupStatus, type Pickup } from "../store"
+import { applyWidgetPicked, applyWidgetTrackUpdates, applyWidgetNewPackages, getPickups, getSettings, normalizeCodes, repairCompanyCodes, setPickupStatus, type Pickup } from "../store"
 
 function exitScript() { Script.exit() }
 
@@ -71,15 +71,17 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
   useEffect(() => {
     // 登录页匿名 cookie 被误存成登录态时自愈（否则显示已授权、接口全 SESSION_EXPIRED）
     sanitizeTaobaoAuth()
-    // 老数据里同一个运单可能被两个平台各存了一条，启动时并一次
-    dedupePickups()
+    // 老数据里同一个运单可能被两个平台各存了一条：每次启动并一次（并掉了就刷新列表）
+    if (dedupePickups() > 0) setRevision(r => r + 1)
     // 老数据里把运单号当取件码存过的，清掉（卡片改显示「待取件」）
     normalizeCodes()
+    // 老数据把认不出的公司名兜底写成了中通：能从文案认出就改回来（只跑一次）
+    if (repairCompanyCodes() > 0) setRevision(r => r + 1)
     // 用菜鸟接口补全取件码（同单号多平台时只追加，不覆盖已有码）
     // 菜鸟被单独解除授权时不拉驿站取件码（淘宝那边不受影响）
     if (platformEnabled("cainiao")) void applyPickupCodes().catch(() => { })
-    // 拼多多驿站待取件也有取件码，授权过就一并补进包裹
-    void applyPddPickupCodes().catch(() => { })
+    // 拼多多驿站待取件：已有的补取件码，本地没有的直接导成包裹（标题写「尾号xxxx包裹」）
+    void importPddStationPackages().then(r => { if (r.imported > 0) setRevision(v => v + 1) }).catch(() => { })
     // 小组件点圈进来：带 act=pick 直接把这条标成已取（只处理一次）
     if (entryAct === "pick" && entryUuid && getPickups().some(p => p.uuid === entryUuid)) {
       setPickupStatus(entryUuid, 2)
@@ -153,7 +155,7 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
   useEffect(() => { syncPickupActivity() }, [revision])
   // 物流包裹刷新（内部限频 5 分钟；顺带重排提醒与更新灵动岛）
   useEffect(() => {
-    void refreshAll("app").then(r => { if (r.changed > 0 || r.fetched) setRevision(x => x + 1) })
+    void refreshAll("app").then(r => { if (r.changed > 0) setRevision(x => x + 1) })
     // 通知图标预热：顺丰这类只有白色 logo 的公司，要在 App 里先把深色底版本渲染成 PNG 落盘，
     // 否则小组件后台发通知时渲染不了，只能退回白图标。
     void warmCourierIcons(getPickups().map(p => p.companyName)).catch(() => { })
@@ -174,8 +176,7 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
       .then(n => { if (n > 0) setRevision(x => x + 1) })
       .catch(() => { })
   }, [])
-  // 平台订单：打开 App 时 maybeFullSync 按前台间隔补到期平台（淘宝要 WebView，只能在前台发现新单）
-  const pullRefresh = async () => { try { await refreshNow() } finally { bump() } }
+  // 平台订单：每 3 小时全量同步一次（由 refreshAll → maybeFullSync 统一处理，小组件刷新也会跑）
   const closeSheet = () => setSheet({ kind: "none" })
   const openSheet = (kind: string, props?: any) => { setSheetNonce(n => n + 1); setSheet({ kind, props }) }
   const closeRoute = () => setRoute(r => {
@@ -193,7 +194,6 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
 
   const pickupPage = (
     <PickupTab revision={revision}
-      onRefresh={pullRefresh}
       onAdd={() => openSheet("trackSearch")}
       onEdit={(p: Pickup) => { setSheetNonce(n => n + 1); setSheet({ kind: "trackDetail", props: { uuid: p.uuid } }) }}
       onIdentityCode={(id: any) => open("identityCode", { id })}
@@ -211,7 +211,6 @@ export default function App({ initialTab, forceDark, pickupUuid }: { initialTab?
   }
   const parcelsPage = (
     <ParcelsTab revision={revision}
-      onRefresh={pullRefresh}
       onAdd={() => openSheet("trackSearch")}
       onEdit={editPickup}
       onExit={exitScript}

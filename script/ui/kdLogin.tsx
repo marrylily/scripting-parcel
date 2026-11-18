@@ -4,7 +4,6 @@
 import { Text, VStack, WebView, useEffect, useState, Toolbar, ToolbarItem, Button } from "scripting"
 import { C } from "../theme"
 import { credentialFromWebView, readLocalStorage, tokenFromLocalStorage } from "../kdniao"
-import { tryScheduleInterval, safeClearInterval } from "../utils/safeTimer"
 
 const LOGIN_URL = "https://m.kdniao.com/#/register"  // 手机版注册页，右下角「已有账号，马上登录」可切登录
 
@@ -29,7 +28,7 @@ export function KdniaoLoginPage({ close, bump }: { close: () => void; bump: () =
 
     // 轮询：手机版写 localStorage["token"]，PC 版写 app-sso.state.accessToken，
     // 统一交给 tokenFromLocalStorage 判断；拿到就换密钥关窗
-    const { id: timer, scheduled: timerOn } = tryScheduleInterval(async () => {
+    const timer = setInterval(async () => {
       if (!alive || done) return
       const ls = await readLocalStorage(wv)
       const token = tokenFromLocalStorage(ls)
@@ -46,10 +45,9 @@ export function KdniaoLoginPage({ close, bump }: { close: () => void; bump: () =
       }
     }, 800)
 
-    if (!timerOn) setMsg("无法轮询登录状态，请关闭后重开本页")
     return () => {
       alive = false
-      safeClearInterval(timer)
+      clearInterval(timer)
       try { wv.dispose() } catch { }
     }
   }, [])

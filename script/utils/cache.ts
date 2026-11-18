@@ -5,6 +5,7 @@
  *  - 已取件超过 30 天的历史包裹（含它那整条物流轨迹）—— 真正会越攒越多的部分
  *  - 识别记录里已经落库/已失败的旧条目（只留还没处理的）
  *  - 身份码缓存（带姓名/证件号）
+ *  - 删除记忆：用户删掉的包裹黑名单（只有这里才会把它忘掉）
  *  - 日志与图标副本：cc/*.log、*.html、*.txt、*.keep、*.bak，以及 cc/logos 里历史遗留的大图副本
  *
  * 绝不碰：
@@ -14,7 +15,7 @@
  *    platformLast.json、arrivedNotif.json、fullSync.json（跨进程状态，删了会重复提醒或丢已取）
  *  - cc/history-backup-*.json（历史遗留备份，留着当保险）
  */
-import { deletePickup, getPickups, resetImportedPackages, resetPickedPackages, type Pickup } from "../store"
+import { clearRemovedPickups, deletePickup, getPickups, removedPickupCount, resetImportedPackages, resetPickedPackages, type Pickup } from "../store"
 import { appliedIntentCount, clearAppliedIntentItems } from "./intentInbox"
 import { clearIdentityCaches } from "./identity"
 
@@ -93,6 +94,8 @@ export interface CacheInfo {
   packages: number
   /** 要删的识别记录数 */
   intents: number
+  /** 要清空的「删除记忆」条数 */
+  removed: number
 }
 
 /** 当前可清理的内容与体积（按钮上显示的数字） */
@@ -105,7 +108,7 @@ export function cacheInfo(days = HISTORY_DAYS): CacheInfo {
   for (const d of dirs) bytes += dirBytes(d)
   const intents = appliedIntentCount()
   bytes += intents * 120
-  return { bytes, files: files.length + dirs.length, packages: oldPickups(days).length, intents }
+  return { bytes, files: files.length + dirs.length, packages: oldPickups(days).length, intents, removed: removedPickupCount() }
 }
 
 /** 清掉；返回实际清理的内容 */
@@ -115,6 +118,8 @@ export function clearCache(days = HISTORY_DAYS): CacheInfo {
   for (const p of oldPickups(days)) {
     try { deletePickup(p.uuid) } catch { }
   }
+  // 1.5) 删除记忆（平台不再导入的黑名单）：按用户要求，只有清缓存才把它忘掉
+  try { clearRemovedPickups() } catch { }
   // 2) 识别记录：只留还没处理的
   try { clearAppliedIntentItems() } catch { }
   // 2.5) 身份码缓存：带真实姓名与证件号，清缓存时一并清掉（下次取码会重新向平台要）

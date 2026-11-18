@@ -1,9 +1,10 @@
 /**
  * 快递鸟（kdniao.com）：
- *  1) 支持 Keychain + App Group (cc/kdniao_shared.json) 双重共享持久化，确保桌面小组件后台 100% 读到密钥；
- *  2) 自动提取账号/设置中的手机号后 4 位填充 CustomerName，彻底解决中通/顺丰/京东在后台因“手机尾号不能为空”静默失败的问题。
+ *  1) 用户在官方页面登录/注册后（滑块验证码、短信都由用户自己完成），
+ *     用页面里的 accessToken 调 queryApiSecretKey 换取 EBusinessID + AppKey 并存进钥匙串；
+ *  2) 用这对凭证走 8001 即时查询拿物流轨迹，支撑「手动查快递」。
  */
-const CRED_KEY = "kdniao.credential"
+const CRED_KEY = "kdniao.credential"     // 与旧「快递聚合」「快递鸟快递跟踪」同 key，可直接复用
 const TOKEN_KEY = "kdniao.token"
 const USER_KEY = "kdniao.user"
 const BIZ_LOGIN_URL = "https://biz.kdniao.com/login"
@@ -17,12 +18,12 @@ import { markWidgetSynced } from "./widgetData"
 import { etaInText } from "./utils/eta"
 import { extractPickupCode as pickupCodeOf } from "./utils/pickupCode"
 import { mergeCodes, codeKey } from "./utils/codes"
-import { detectCompany as cnDetectCompany } from "./utils/cainiao"
+import { detectCompany as cnDetectCompany, trackMailNo as cnTrackMailNo } from "./utils/cainiao"
 import { notifyArrived } from "./utils/reminders"
 import { arrivedAtOf } from "./utils/arrive"
 import { refreshPlatformParcels } from "./platforms"
 import { notify } from "./ui/notify"
-import { safeDelay } from "./utils/safeTimer"
+import { companyCode } from "./theme"
 
 declare const fetch: any
 
@@ -32,9 +33,26 @@ export interface KdniaoUser {
   companyName?: string
 }
 
+/* ---------------- 凭证 / 登录态 / 资料存取 ---------------- */
+
+export function loadUser(): KdniaoUser | null {
+  try {
+    const raw = Keychain.get(USER_KEY)
+    if (!raw) return null
+    const v = JSON.parse(raw)
+    if (v && typeof v.nickName === "string") return v
+  } catch { }
+  return null
+}
+
+function saveUser(u: KdniaoUser) { try { Keychain.set(USER_KEY, JSON.stringify(u)) } catch { } }
+export function loadToken(): string { try { return Keychain.get(TOKEN_KEY) ?? "" } catch { return "" } }
+export function clearToken() { try { Keychain.remove(TOKEN_KEY); Keychain.remove(USER_KEY) } catch { } }
+
 export interface KdniaoCredential {
   eBusinessId: string
   appKey: string
+  /** 快递鸟后台的用户ID，通常与 EBusinessID 相同 */
   userId?: string
   savedAt?: number
 }
@@ -48,117 +66,46 @@ export interface TrackResult {
   status: "none" | "transit" | "delivered"
   latest: string
   nodes: TrackNode[]
+  /** 数据来源，界面会显示，避免两个源的轨迹看起来“不一样” */
   source?: string
+  /** 快递鸟未取到取件码时可手填，存在这里同步给包裹 */
   pickupCode?: string
+  /** 收货城市 / 完整收货地址（8001 的 Receiver 字段，套餐含地址服务时才有） */
   receiverCity?: string
   receiverAddress?: string
 }
 
-/* ---------------- App Group 共享镜像（供小组件后台读取） ---------------- */
-
-const SHARED_KD_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/kdniao_shared.json`
-
-function readSharedKd(): {
-  cred?: KdniaoCredential
-  user?: KdniaoUser
-  token?: string
-  phones?: Record<string, string>
-  codes?: Record<string, string>
-  defaultTail?: string
-} {
-  try {
-    const f = SHARED_KD_FILE()
-    if (!FileManager.existsSync(f)) return {}
-    return JSON.parse(FileManager.readAsStringSync(f) || "{}") || {}
-  } catch { return {} }
-}
-
-function writeSharedKd(patch: Record<string, any>): void {
-  try {
-    const dir = `${FileManager.appGroupDocumentsDirectory}/cc`
-    if (!FileManager.existsSync(dir)) FileManager.createDirectorySync(dir, true)
-    const prev = readSharedKd()
-    FileManager.writeAsStringSync(SHARED_KD_FILE(), JSON.stringify({ ...prev, ...patch }))
-  } catch { }
-}
-
-/** 提取任意手机号字符串的后 4 位数字 */
-function tail4(raw?: string): string {
-  if (!raw) return ""
-  const digits = String(raw).replace(/\D+/g, "")
-  return digits.length >= 4 ? digits.slice(-4) : ""
-}
-
-/* ---------------- 凭证 / 登录态 / 资料存取 ---------------- */
-
-export function loadUser(): KdniaoUser | null {
-  try {
-    const raw = Keychain.get(USER_KEY)
-    if (raw) {
-      const v = JSON.parse(raw)
-      if (v && typeof v.nickName === "string") {
-        // 顺手同步到共享文件，方便小组件后台读取手机号后 4 位
-        writeSharedKd({ user: v, ...(tail4(v.mobile) ? { defaultTail: tail4(v.mobile) } : {}) })
-        return v
-      }
-    }
-  } catch { }
-  const shared = readSharedKd().user
-  return shared && typeof shared.nickName === "string" ? shared : null
-}
-
-function saveUser(u: KdniaoUser) {
-  try { Keychain.set(USER_KEY, JSON.stringify(u)) } catch { }
-  writeSharedKd({ user: u, ...(tail4(u.mobile) ? { defaultTail: tail4(u.mobile) } : {}) })
-}
-
-export function loadToken(): string {
-  try {
-    const t = Keychain.get(TOKEN_KEY) ?? ""
-    if (t) {
-      writeSharedKd({ token: t })
-      return t
-    }
-  } catch { }
-  return readSharedKd().token ?? ""
-}
-
-export function clearToken() {
-  try { Keychain.remove(TOKEN_KEY); Keychain.remove(USER_KEY) } catch { }
-  writeSharedKd({ token: "", user: undefined })
-}
+/* ---------------- 凭证存取 ---------------- */
 
 export function loadCredential(): KdniaoCredential | null {
   try {
     const raw = Keychain.get(CRED_KEY)
-    if (raw) {
-      const v = JSON.parse(raw)
-      if (v && typeof v.eBusinessId === "string" && typeof v.appKey === "string") {
-        writeSharedKd({ cred: v })
-        return v
-      }
-    }
+    if (!raw) return null
+    const v = JSON.parse(raw)
+    if (v && typeof v.eBusinessId === "string" && typeof v.appKey === "string") return v
   } catch { }
-  const shared = readSharedKd().cred
-  if (shared && typeof shared.eBusinessId === "string" && typeof shared.appKey === "string") {
-    return shared
-  }
   return null
 }
 
 export function saveCredential(cred: KdniaoCredential) {
-  const c = { ...cred, savedAt: Date.now() }
-  try { Keychain.set(CRED_KEY, JSON.stringify(c)) } catch { }
-  writeSharedKd({ cred: c })
+  Keychain.set(CRED_KEY, JSON.stringify({ ...cred, savedAt: Date.now() }))
 }
 
 export function clearCredential() {
   try { Keychain.remove(CRED_KEY) } catch { }
-  writeSharedKd({ cred: undefined })
 }
 
 /* ---------------- 登录页 → 自动取 EBusinessID / AppKey ---------------- */
 
+/**
+ * 打开快递鸟官方登录/注册页。滑块验证码与短信验证只能由用户完成，
+ * 这里不绕过验证码，只负责：登录状态 → accessToken → 接口换密钥。
+ */
+/**
+ * 往登录页注入一个悬浮「保存并返回」按钮。
+ * 原生 present 不支持自定义导航栏按钮，所以只能写在页面里；
+ * 点击时把页面自己的 localStorage 登录态回传给原生，随即收起页面。
+ */
 const SAVE_BUTTON_JS = `
 (function () {
   var mk = function () {
@@ -184,6 +131,8 @@ const SAVE_BUTTON_JS = `
 })()
 `
 
+
+/** 读 WebView 里的整个 localStorage（键值对） */
 export async function readLocalStorage(wv: WebViewController): Promise<Record<string, string>> {
   try {
     const dump = String(await wv.evaluateJavaScript(
@@ -195,6 +144,7 @@ export async function readLocalStorage(wv: WebViewController): Promise<Record<st
   } catch { return {} }
 }
 
+/** 去掉可能的 JSON 引号包裹 */
 function cleanToken(v: any): string {
   let s = typeof v === "string" ? v.trim() : ""
   if (!s) return ""
@@ -202,6 +152,10 @@ function cleanToken(v: any): string {
   return s.trim()
 }
 
+/** 从 localStorage 里取访问令牌。
+ *  - 手机版 m.kdniao.com：`token`（前端请求头就是 Authorization: localStorage.getItem("token")）
+ *  - PC 版 biz.kdniao.com：`app-sso`.state.accessToken
+ *  注意 `flushtoken` 是刷新令牌，拿去当访问令牌会回「token已过期或者未登录」 */
 export function tokenFromLocalStorage(ls: Record<string, string>): string {
   const direct = cleanToken(ls["token"])
   if (direct && direct.length >= 12) return direct
@@ -215,6 +169,7 @@ export function tokenFromLocalStorage(ls: Record<string, string>): string {
     } catch { }
   }
 
+  // 兜底：只认键名里带 token 且不是刷新令牌的项
   for (const k of Object.keys(ls)) {
     if (/flush|refresh/i.test(k)) continue
     if (!/token/i.test(k)) continue
@@ -224,18 +179,19 @@ export function tokenFromLocalStorage(ls: Record<string, string>): string {
   return ""
 }
 
+/** 从登录页的 WebView 里读登录态，换密钥并落盘。 */
 export async function credentialFromWebView(wv: WebViewController): Promise<KdniaoCredential> {
   const ls = await readLocalStorage(wv)
   const token = tokenFromLocalStorage(ls)
   if (!token) throw new Error("还没有登录成功，先在页面里完成登录或注册")
   try { Keychain.set(TOKEN_KEY, token) } catch { }
-  writeSharedKd({ token })
   const cred = await fetchCredentialByToken(token)
   saveCredential(cred)
   try { saveUser(await fetchUserInfo(token)) } catch { }
   return cred
 }
 
+/** 用 accessToken 换该账号下的 API 密钥（用户ID + API KEY） */
 export async function fetchCredentialByToken(token: string): Promise<KdniaoCredential> {
   const res = await fetch(`${API_BASE}/user-api/user/queryApiSecretKey`, {
     method: "POST",
@@ -260,6 +216,7 @@ export async function fetchCredentialByToken(token: string): Promise<KdniaoCrede
   return { eBusinessId, appKey, userId: String(first.userId ?? ""), savedAt: Date.now() }
 }
 
+/** 读快递鸟账号资料（昵称/手机号），用于页面同步显示 */
 export async function fetchUserInfo(token: string): Promise<KdniaoUser> {
   const res = await fetch(`${API_BASE}/user-api/user/getInfo`, {
     method: "POST",
@@ -285,6 +242,7 @@ export async function fetchUserInfo(token: string): Promise<KdniaoUser> {
   return out
 }
 
+/** 快递鸟 ShipperCode → 本机公司编号（见 theme.companyName） */
 export function companyIndex(shipperCode: string): number {
   switch ((shipperCode || "").toUpperCase()) {
     case "ZTO": return 1
@@ -318,8 +276,8 @@ export interface TrackHistoryItem {
 const HISTORY_KEY = "cc.track.history"
 
 export function loadTrackHistory(): TrackHistoryItem[] {
-  const v = Storage.get<any>(HISTORY_KEY)
-  return Array.isArray(v) ? v.filter((x: any) => x && typeof x.mailNo === "string").slice(0, 30) : []
+  const v = Storage.get<TrackHistoryItem[]>(HISTORY_KEY)
+  return Array.isArray(v) ? v.filter(x => x && typeof x.mailNo === "string").slice(0, 30) : []
 }
 
 export function pushTrackHistory(item: TrackHistoryItem) {
@@ -336,8 +294,10 @@ export function clearTrackHistory() {
   try { Storage.set(HISTORY_KEY, []) } catch { }
 }
 
+/** 台账轨迹里出现取件码时提取出来（取件页会用到）；实现见 utils/pickupCode */
 export { extractPickupCode } from "./utils/pickupCode"
 
+/** 用当前 token 领一次免费试用套餐；token 过期会先尝试从登录页刷新 */
 export async function claimTrialPackage(): Promise<boolean> {
   const call = async (t: string) => {
     const r = await fetch(`${API_BASE}/champion-api/user/guide/receiveTrial`, {
@@ -362,38 +322,58 @@ export async function claimTrialPackage(): Promise<boolean> {
   return res.status === 200 && res.text.includes("\"code\":200")
 }
 
+/** 服务端是不是在说“去领取试用”：只有这种提示才自动领 */
+function needsClaim(reason: string): boolean {
+  const t = String(reason || "")
+  if (!t) return false
+  // 已经领过 / 已用过 / 已过期 / 需要购买或开通：都不属于“可领取”
+  if (/已领取|已领过|已使用|已过期|购买|充值|开通/.test(t)) return false
+  return /(?:请|需要|可|去).{0,8}领取|未领取|领取.{0,6}(?:试用|免费)|(?:试用|免费).{0,6}领取/.test(t)
+}
+
+let lastClaimAt = 0
+/** 一次运行只领一次：批量查 20 单时不要连着点领取接口 */
+async function claimTrialPackageOnce(): Promise<boolean> {
+  if (Date.now() - lastClaimAt < 10 * 60_000) return false
+  lastClaimAt = Date.now()
+  try { return await claimTrialPackage() } catch { return false }
+}
+
+/** 静默打开登录页刷新 accessToken（不弹界面） */
 export async function refreshTokenFromWebView(): Promise<string> {
   const wv = new WebViewController()
   try {
     await wv.loadURL(BIZ_LOGIN_URL)
-    await safeDelay(3000)
+    await new Promise<void>(r => setTimeout(() => r(), 3000))
     const raw = String(await wv.evaluateJavaScript("return localStorage.getItem('app-sso') || ''") ?? "")
     let token = ""
     try { token = JSON.parse(raw || "{}")?.state?.accessToken || "" } catch { }
-    if (token) {
-      try { Keychain.set(TOKEN_KEY, token) } catch { }
-      writeSharedKd({ token })
-    }
+    if (token) { try { Keychain.set(TOKEN_KEY, token) } catch { } }
     return token
   } catch { return "" } finally { try { wv.dispose() } catch { } }
 }
 
+/** 刷新所有物流包裹。返回更新的条数。
+ *  - `platforms: false` 时跳过淘宝/京东/拼多多的抓取（小组件扩展里跑 WebView 不可靠）
+ *  - `minGapMs` 控制限频，由调用方决定（App 前台/小组件/手动） */
 export async function refreshTrackedPackages(opts?: {
   platforms?: boolean
   minGapMs?: number
+  /** 跳过全局限频：刚导入/刚从没轨迹的包裹要马上查，不能等 20 分钟 */
   force?: boolean
+  /** 只刷这几个运单号（导入后的定向补全） */
   only?: string[]
+  /** 本次最多查几条 */
   max?: number
 }): Promise<number> {
-  // 每次在主 App 触发刷新时，顺便把凭证和用户信息同步到共享目录
-  try { loadCredential(); loadUser() } catch { }
-
   const LAST = "cc.track.lastRefresh"
   const minGap = opts?.minGapMs ?? 20 * 60 * 1000
   const last = Number(Storage.get<number>(LAST) ?? 0)
   if (!opts?.force && Date.now() - last < minGap) return 0
   try { Storage.set(LAST, Date.now()) } catch { }
 
+  // 平台授权的包裹也一起刷：各平台走自己的接口，不经过快递鸟
+  // （组件扩展里 WebView 其实可用，但轻量刷新由 widgetRefresh 自己调度，这里只服务前台）
   let platformChanged = 0
   if (opts?.platforms !== false) {
     try {
@@ -407,15 +387,42 @@ export async function refreshTrackedPackages(opts?: {
     list = list.filter(p => want.has(String(p.mailNo).replace(/[\s-]/g, "").toLowerCase()))
   }
   let changed = 0
+  // 本轮「单号查不到」之类的业务失败：收齐后只说一句，不抢着当登录问题报
+  const bizFails: string[] = []
   for (const p of list.slice(0, opts?.max ?? 20)) {
+    // 用户已点过取件：不再管它的物流，也不改状态
     if (p.pickedByUser) continue
     const no = p.mailNo as string
+    // 不认识快递公司就先认一次：菜鸟（免登录）→ 快递100 → 快递鸟（登录了才走）。
+    // 快捷指令导入时只能拿到单号，就是靠这一步补上公司和图标的。
+    if (!Number(p.companyName)) {
+      const det = await detectShipper(no).catch(() => null)
+      const cid = det?.company ? companyCode(det.company) : 0
+      if (cid > 0) {
+        updatePickup(p.uuid, { companyName: cid, trackCompany: p.trackCompany || det!.company })
+        p.companyName = cid
+        changed++
+      }
+    }
     try {
-      const r = await queryTracking(no, { shipperCode: p.shipperCode })
+      // 轨迹也是先菜鸟（免登录、不需要凭证），菜鸟没节点才算快递鸟
+      const cnTrace = await cnTrackMailNo(no).catch(() => null)
+      const cnNodes = cnTrace?.nodes ?? []
+      const r: TrackResult = cnNodes.length > 0
+        ? {
+          shipperCode: p.shipperCode ?? "", company: cnTrace?.company ?? "", state: "",
+          status: (/签收|已送达|已取件|已投递/.test(cnNodes[0].text) ? "delivered" : "transit") as TrackResult["status"],
+          latest: cnNodes[0].text, nodes: cnNodes,
+        }
+        : await queryTracking(no, { shipperCode: p.shipperCode })
       if (r.nodes.length === 0) continue
+      // 文案没变且已经是待取：不用重复处理（否则每 20 分钟写一次库）
+      // 但状态还不是待取时要继续跑，否则「已到站」永远不会补发通知
       if (r.latest === p.trackLatest && p.status === 1) continue
+      // 驿站归属从最新轨迹里推（没有短信导入，只靠物流文案）
       const station = matchStation([r.latest, p.itemTitle ?? ""].filter(Boolean).join("\n"))
       const arrival = arrivalState(r.latest)
+      // 进入「待取」就发一条到站提醒（同包裹只提醒一次）
       if (arrival === "arrived") {
         await notifyArrived({
           ...p,
@@ -424,38 +431,91 @@ export async function refreshTrackedPackages(opts?: {
         })
       }
       const eta = etaInText(r.latest)
+      // 这次物流里新出现的取件码也并进去（同一包裹可能先在某个平台看到码）
       const newCode = pickupCodeOf(r.nodes) || pickupCodeOf([{ text: r.latest }])
       const merged = mergeCodes(p.codes ?? (p.code ? [p.code] : []), newCode)
       const gained = merged.length > (p.codes?.length ?? (p.code ? 1 : 0))
+      // 快递鸟返回的公司名也要沉到卡片上：快捷指令导入时只能拿到单号，
+      // 不在这里写回去，那个包裹会永远显示「其他快递」
+      const cn = r.company ? companyCode(r.company) : 0
       updatePickup(p.uuid, {
         trackLatest: r.latest,
         trackNodes: r.nodes,
         trackUpdatedAt: Date.now(),
         trackCompany: r.company || p.trackCompany,
+        ...(cn > 0 && cn !== p.companyName ? { companyName: cn } : {}),
         notes: r.latest,
         ...(eta ? { eta } : {}),
         ...(gained ? { codes: merged, code: codeKey(p.code) === codeKey(merged[0]) ? p.code : merged[0] } : {}),
+        // 到站可取 → 待取；已取走 → 已取；在路上保留原状态
         status: arrival === "picked" ? 2 : arrival === "arrived" ? 1 : p.status,
+        // 自动识别签收也保留真实签收时间，供“本月取件”统计；已有手动取件时间时不覆盖。
         ...(arrival === "picked" ? { pickedAt: p.pickedAt ?? arrivedAtOf(r.nodes) ?? Date.now() } : {}),
+        // 到站时间取轨迹里的节点时间；已有就不覆盖（避免每次刷新都往后跳）
         ...(arrival === "arrived" ? { arrivedAt: p.arrivedAt ?? arrivedAtOf(r.nodes) ?? Date.now() } : {}),
         ...(station ? { courierStationName: station.name, courierStationUuid: station.uuid } : {}),
       })
       changed++
     } catch (e: any) {
+      // 凭证/接口异常在界面上弹一下，否则后台刷新失败用户完全不知情。
+      // 但“单号查不到”“参数不对”经常也带“无效/非法”字样，不能当成登录失效——
+      // 先按文案分关，真的像凭证问题再问一次账号资料：能拿到用户信息就说明凭证是好的。
       const t = String(e?.message ?? e)
-      if (/密钥|无效|未授权|EBusinessID|AppKey|额度|余额/.test(t)) notify("快递鸟凭证异常，请重新登录", "warn")
+      if (looksLikeCredentialError(t)) {
+        const u = await refreshUser().catch(() => null)
+        if (!u && Date.now() - lastCredNotifyAt > 10 * 60_000) {
+          lastCredNotifyAt = Date.now()
+          notify("快递鸟凭证异常，请重新登录", "warn")
+        }
+      } else {
+        // 这一单确实查不到（单号无效/无轨迹/要手机尾号…）：如实告诉用户是哪一单、为什么，
+        // 同一单号 30 分钟内只说一次，避免批量刷新时刷屏
+        const n = String(p.mailNo || "")
+        if (Date.now() - (lastBizNotifyAt[n] ?? 0) > 30 * 60_000) {
+          lastBizNotifyAt[n] = Date.now()
+          bizFails.push(`单号 ${n} 查询失败：${shortReason(t)}`)
+        }
+      }
     }
   }
+  if (bizFails.length > 0) {
+    const uniq = Array.from(new Set(bizFails))
+    notify(uniq.length === 1 ? uniq[0] : `${uniq.length} 个单号查询失败：${uniq[0].split("：").pop()}`, "info")
+  }
+  // 记录本次同步时间，小组件底部会显示「xx:xx 同步」
   markWidgetSynced()
   return changed + platformChanged
 }
 
-export function maskPhone(p?: string): string {
+/** 手机号中间四位打码 */export function maskPhone(p?: string): string {
   const s = (p ?? "").replace(/\s+/g, "")
   if (s.length < 7) return s
   return s.slice(0, 3) + "****" + s.slice(-4)
 }
 
+/** 只有「凭证 / 登录态」类失败才算登录失效：单号查不到、参数不对、限流超时都不算 */
+export function looksLikeCredentialError(msg: string): boolean {
+  const t = String(msg || "")
+  // 先排除业务类错误：这些文案里经常也带「无效 / 非法」，不代表凭证坏了
+  if (/单号|运单|无轨迹|无结果|查无|不存在|参数|格式|不支持|频率|限流|超时|繁忙|套餐|网络|HTTP/.test(t)) return false
+  return /EBusinessID|AppKey|密钥|未授权|额度|余额|凭证|token|Token|登录|授权/.test(t)
+}
+
+/** 把「快递鸟：单号无效」压成一句短原因，给卡片/提示用 */
+export function shortReason(msg: string): string {
+  const s = String(msg || "").replace(/^快递鸟[:：]\s*/, "").replace(/\s+/g, " ").trim()
+  if (!s) return "查不到轨迹"
+  return s.length > 28 ? s.slice(0, 28) + "…" : s
+}
+
+/** 「这一单查不到」提示的节流（按单号） */
+const lastBizNotifyAt: Record<string, number> = {}
+
+/** 凭证异常提示的节流：同一轮启动里 10 分钟不重复弹 
+ */
+let lastCredNotifyAt = 0
+
+/** 用已保存的登录态刷新账号资料；失败返回 null，不抛错 */
 export async function refreshUser(): Promise<KdniaoUser | null> {
   const t = loadToken()
   if (!t) return null
@@ -487,23 +547,72 @@ const COM2SHIPPER: Record<string, string> = {
 }
 
 export async function detectShipper(mailNo: string): Promise<{ shipperCode: string; company: string; type: string }> {
+  // 1) 有淘宝登录态就先问菜鸟：免 key，也不把单号发给第三方
   const cn = await cnDetectCompany(mailNo).catch(() => null)
   if (cn) {
     const key = cn.cpCode.toLowerCase()
     return { shipperCode: COM2SHIPPER[key] || cn.cpCode.toUpperCase(), company: cn.cpName, type: cn.cpCode }
   }
 
-  const res = await fetch(`https://www.kuaidi100.com/autonumber/autoComNum?resultv2=1&text=${encodeURIComponent(mailNo)}`, {
-    headers: { "User-Agent": KD100_UA, Referer: "https://www.kuaidi100.com/", Accept: "application/json, text/plain, */*" },
-  })
-  if (!res.ok) throw new Error(`快递公司识别失败（HTTP ${res.status}）`)
-  const body = await res.text()
-  let json: any
-  try { json = JSON.parse(body) } catch { throw new Error("快递公司识别失败：返回无法解析") }
-  const first = json && Array.isArray(json.auto) ? json.auto[0] : null
-  const comCode = first && first.comCode ? String(first.comCode) : ""
-  if (!comCode) throw new Error("无法自动识别快递公司，请手动填写快递公司代码")
-  return { shipperCode: COM2SHIPPER[comCode] || comCode.toUpperCase(), company: first.name || "", type: comCode }
+  // 2) 菜鸟没认出：快递100 的公开识别（不需要凭证）
+  const k100 = await detectByKd100(mailNo)
+  if (k100) return k100
+
+  // 3) 最后兜底：快递鸟的单号识别（2002），登录了账号才走
+  const kd = await detectByKdniao(mailNo)
+  if (kd) {
+    const key = kd.shipperCode.toLowerCase()
+    return { shipperCode: COM2SHIPPER[key] || kd.shipperCode.toUpperCase(), company: kd.company, type: kd.shipperCode }
+  }
+
+  throw new Error("无法自动识别快递公司，请手动填写快递公司代码")
+}
+
+/** 快递100 公开识别（不需要任何凭证） */
+async function detectByKd100(mailNo: string): Promise<{ shipperCode: string; company: string; type: string } | null> {
+  try {
+    const res = await fetch(`https://www.kuaidi100.com/autonumber/autoComNum?resultv2=1&text=${encodeURIComponent(mailNo)}`, {
+      headers: { "User-Agent": KD100_UA, Referer: "https://www.kuaidi100.com/", Accept: "application/json, text/plain, */*" },
+    })
+    if (!res.ok) return null
+    const json: any = JSON.parse(await res.text())
+    const first = json && Array.isArray(json.auto) ? json.auto[0] : null
+    const comCode = first && first.comCode ? String(first.comCode) : ""
+    if (!comCode) return null
+    return { shipperCode: COM2SHIPPER[comCode] || comCode.toUpperCase(), company: first.name || "", type: comCode }
+  } catch { return null }
+}
+
+/** 快递鸟单号识别（RequestType=2002）：用户登了快递鸟才用，菜鸟/快递100 都认不出时的最后一道 */
+async function detectByKdniao(mailNo: string): Promise<{ shipperCode: string; company: string } | null> {
+  const cred = loadCredential()
+  if (!cred) return null
+  const requestData = JSON.stringify({ LogisticCode: mailNo })
+  const body =
+    `RequestData=${encodeURIComponent(requestData)}` +
+    `&EBusinessID=${encodeURIComponent(cred.eBusinessId)}` +
+    `&RequestType=2002` +
+    `&DataSign=${sign(requestData, cred.appKey)}` +
+    `&DataType=2`
+  try {
+    const res = await fetch(QUERY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": KD100_UA,
+        Referer: QUERY_URL,
+        Accept: "application/json, text/plain, */*",
+      },
+      body,
+    })
+    if (!res.ok) return null
+    const json: any = JSON.parse(await res.text())
+    if (!json?.Success) return null
+    const list = Array.isArray(json.Shippers) ? json.Shippers : []
+    const first = list[0]
+    if (!first || !first.ShipperCode) return null
+    return { shipperCode: String(first.ShipperCode), company: String(first.ShipperName ?? "") }
+  } catch { return null }
 }
 
 /* ---------------- 8001 即时查询 ---------------- */
@@ -511,6 +620,7 @@ export async function detectShipper(mailNo: string): Promise<{ shipperCode: stri
 function sign(requestData: string, appKey: string): string {
   const raw = Data.fromRawString(requestData + appKey)
   if (!raw) throw new Error("签名失败")
+  // 实测必须是小写十六进制：大写会返回「非法参数」，小写才能过签名校验
   const md5hex = Crypto.md5(raw).toHexString().toLowerCase()
   const hexData = Data.fromRawString(md5hex)
   if (!hexData) throw new Error("签名失败")
@@ -523,62 +633,31 @@ function statusOf(state: any, latest: string): "none" | "transit" | "delivered" 
   return "transit"
 }
 
+/** 手机尾号按运单号记住，下次查同一单自动带上 */
 const PHONE_KEY = "cc.track.phone"
 
 function phoneMap(): Record<string, string> {
-  try {
-    const v = Storage.get<any>(PHONE_KEY)
-    if (v && typeof v === "object") {
-      writeSharedKd({ phones: v })
-      return v
-    }
-  } catch { }
-  return readSharedKd().phones ?? {}
+  const v = Storage.get<Record<string, string>>(PHONE_KEY)
+  return v && typeof v === "object" ? v : {}
 }
 
 export function getPhoneFor(mailNo: string): string {
-  const key = mailNo.replace(/\s+/g, "")
-  const m = phoneMap()
-  if (m[key]) return m[key]
-  // 兜底：自动取快递鸟账号手机号后 4 位或共享默认尾号（解决中通/顺丰/京东后台查单缺尾号报错）
-  const shared = readSharedKd()
-  if (shared.defaultTail) return shared.defaultTail
-  const u = loadUser()
-  const uTail = tail4(u?.mobile)
-  if (uTail) return uTail
-  try {
-    // 尝试从共享快照 widget.json 或拼多多/小米手机号里找默认后 4 位
-    const snapFile = `${FileManager.appGroupDocumentsDirectory}/cc/widget.json`
-    if (FileManager.existsSync(snapFile)) {
-      const snap = JSON.parse(FileManager.readAsStringSync(snapFile) || "{}")
-      const sPhone = tail4(snap?.settings?.defaultPhone || snap?.settings?.phone || snap?.settings?.mobile)
-      if (sPhone) return sPhone
-    }
-  } catch { }
-  return ""
+  return phoneMap()[mailNo.replace(/\s+/g, "")] ?? ""
 }
 
 export function savePhoneFor(mailNo: string, phone: string) {
   const m = phoneMap()
-  const clean = tail4(phone) || phone.trim()
-  m[mailNo.replace(/\s+/g, "")] = clean
+  m[mailNo.replace(/\s+/g, "")] = phone.trim()
   try { Storage.set(PHONE_KEY, m) } catch { }
-  writeSharedKd({ phones: m, ...(clean.length === 4 ? { defaultTail: clean } : {}) })
 }
 
 const CODE_KEY = "cc.track.code"
 
 function codeMap(): Record<string, string> {
-  try {
-    const v = Storage.get<any>(CODE_KEY)
-    if (v && typeof v === "object") {
-      writeSharedKd({ codes: v })
-      return v
-    }
-  } catch { }
-  return readSharedKd().codes ?? {}
+  try { const v = Storage.get(CODE_KEY); return v && typeof v === "object" ? (v as Record<string, string>) : {} } catch { return {} }
 }
 
+/** 用户手填的取件码（和运单号绑定，再次查询自动带出） */
 export function getCodeFor(mailNo: string): string {
   return codeMap()[mailNo.replace(/\s+/g, "")] ?? ""
 }
@@ -587,7 +666,6 @@ export function saveCodeFor(mailNo: string, code: string) {
   const m = codeMap()
   m[mailNo.replace(/\s+/g, "")] = code.trim()
   try { Storage.set(CODE_KEY, m) } catch { }
-  writeSharedKd({ codes: m })
 }
 
 function needPhoneError(msg: string) {
@@ -605,8 +683,8 @@ async function queryKdniao8001(
   if (!cred) throw new Error("还没有连接快递鸟账号")
 
   const rd: any = { LogisticCode: no, ShipperCode: shipperCode }
-  const cleanTail = tail4(phone) || phone.trim()
-  if (cleanTail) rd.CustomerName = cleanTail
+  // 中通/顺丰/京东的即时查询要收件人手机号后四位（字段名 CustomerName）
+  if (phone) rd.CustomerName = phone
   const requestData = JSON.stringify(rd)
   const body =
     `RequestData=${encodeURIComponent(requestData)}` +
@@ -631,33 +709,43 @@ async function queryKdniao8001(
     try { return JSON.parse(text) } catch { throw new Error("快递鸟返回了无法解析的数据") }
   }
 
+  // 1002（官网文档里的「轨迹查询」指令）也试过：同一个账号同样返回「没有可用套餐」，
+  // 2002 单号识别却能过 → 说明与 RequestType 无关，是账号侧没有即时查询额度。
   let json = await post()
-  if (!json.Success && String(json.Reason ?? "").includes("套餐")) {
-    if (await claimTrialPackage()) json = await post()
+  // 只有快递鸟**明确让去领取**时才自动领（比如新账号提示“请领取免费试用”）；
+  // 已经领过、无库存、需购买、账号不符都不会走这里，避免每个账号都盲领一次。
+  const firstReason = String(json.Reason ?? "")
+  if (!json.Success && needsClaim(firstReason)) {
+    if (await claimTrialPackageOnce()) json = await post()
   }
   if (!json.Success) {
     const reason = String(json.Reason ?? "")
     if (reason.includes("手机尾号不能为空")) throw needPhoneError("这个单号需要收件人手机号后四位")
     if (reason.includes("手机尾号不正确")) throw needPhoneError("手机号后四位不正确")
-    if (reason.includes("套餐")) throw new Error("快递鸟账号没有可用套餐，自动领取失败")
-    if (reason.includes("非法参数")) throw new Error("快递鸟拒绝了请求，请重新登录账号刷新密钥")
+    // 套餐类错误只如实转述服务端原话：不替用户下单、也不把“查不到单号”包装成缺套餐
+    if (/套餐|试用|额度/i.test(reason)) throw new Error("快递鸟：" + (reason || "账号暂无可用套餐"))
+    if (reason.includes("非法参数")) throw new Error("快递鸟：" + (reason || "参数被拒绝"))
     throw new Error("快递鸟：" + (reason || "查询失败"))
   }
 
   const traces: any[] = (json.Traces || []).filter((t: any) => t && t.AcceptStation)
   traces.sort((a, b) => String(a.AcceptTime || "").localeCompare(String(b.AcceptTime || "")))
+  // AcceptStation 可能是字符串，也可能嵌套对象（新版接口/地址服务开启时），统一拍平成文本
   const flatten = (v: any, depth = 0): string => {
     if (v == null || depth > 4) return ""
     if (typeof v === "string") return v
     if (typeof v === "number") return String(v)
     if (Array.isArray(v)) return v.map(x => flatten(x, depth + 1)).filter(Boolean).join(" ")
     if (typeof v === "object") {
+      // 常见嵌套：{Station:{...},Desc:"..."} 或 {AcceptStation:"...",Remark:"..."}
       const keys = ["Desc", "AcceptStation", "Station", "Content", "Text", "Description", "Remark"]
       const parts: string[] = []
       for (const k of keys) { const s = flatten(v[k], depth + 1); if (s) parts.push(s) }
       if (parts.length > 0) return parts.join(" ")
+      // 兑底：拍平所有字符串字段
       for (const k of Object.keys(v)) { const s = flatten(v[k], depth + 1); if (s) parts.push(s) }
       if (parts.length > 0) return parts.join(" ")
+      // 还是什么都没有：把原始 JSON 显示出来，至少能看出数据形态，方便排查
       try { const s = JSON.stringify(v); return s && s !== "{}" ? s : "" } catch { return "" }
     }
     return ""
@@ -667,6 +755,7 @@ async function queryKdniao8001(
     text: flatten(t.AcceptStation).replace(/\s+/g, " ").trim(),
   })).filter(n => n.text)
   const latest = nodes.length > 0 ? nodes[nodes.length - 1].text : ""
+  // 8001 在套餐包含地址服务时会返回 Receiver；没有就是 undefined，不要编
   const rc = json.Receiver ?? null
   const receiverCity = rc ? String(rc.CityName ?? "").trim() : ""
   const receiverAddress = rc
@@ -691,7 +780,8 @@ export async function queryTracking(
 ): Promise<TrackResult> {
   const no = mailNo.replace(/\s+/g, "")
   if (!no) throw new Error("请输入运单号")
-  if (!loadCredential()) throw new Error("快递鸟未授权，请到 设置 → 账户 登录授权后再查")
+  // 未授权时明确提示，不要再往下走让它报成「没识别快递公司」之类的误导信息
+  if (!loadCredential()) throw new Error("快递鸟未授权，请到 设置 → 账号授权 登录授权后再查")
 
   let shipperCode = (opts?.shipperCode || "").trim().toUpperCase()
   let company = ""
@@ -701,7 +791,9 @@ export async function queryTracking(
     company = det.company
   }
 
+  // 手机尾号：调用方传入 > 该单号记住的
   const phone = (opts?.phone || getPhoneFor(no) || "").trim()
 
+  // 只用快递鸟：查不到就直接把错误给界面，不做网页兜底
   return { ...(await queryKdniao8001(no, shipperCode, company, phone)), pickupCode: getCodeFor(no) }
 }

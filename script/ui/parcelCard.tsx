@@ -12,9 +12,9 @@
  * 图标一律「共享目录优先、工程资源兜底」，组件里前者有、后者没有。
  */
 import { HStack, Image, Text, VStack, ZStack, Script } from "scripting"
-import { C, CLOSED_TINT, RR, companyName } from "../theme"
+import { C, CLOSED_TINT, RR, companyName, companyCode } from "../theme"
 import { AppBrandMark, PlatformMark } from "./platformMark"
-import { cardTitleOf, dateText, isAwaitingPickup, pickupTimeOf, sourceOf, stationHaystack } from "../utils/model"
+import { cardTitleOf, dateText, isAwaitingPickup, isReturningText, pickupTimeOf, sourceOf, stationHaystack } from "../utils/model"
 import { codeKey, extraCodes } from "../utils/codes"
 import { matchStationIn } from "../utils/stationMatch"
 
@@ -82,40 +82,17 @@ const TILE_COLOR: Record<string, any> = {
   "shansong.png": "#2F7BF6",
 }
 
-/** 编号缺失（平台新接入的公司）时按名称猜图标 */
+/** 编号缺失（平台新接入的公司）时按名称猜图标。
+ *  统一走 theme.companyCode 的别名表，不要在这里再维护一份关键词：
+ *  两处词表迟早对不上，就会出现「认得出公司名但图标不出来」。 */
 function inferCourier(hint: string): string | undefined {
-  const t = hint ?? ""
-  if (/菜鸟|驿站/.test(t)) return "cainiao.png"
-  if (/丰巢|快递柜/.test(t)) return "hive.png"
-  if (/京东/.test(t)) return "jd.png"
-  if (/顺丰/.test(t)) return "sf_white.png"
-  if (/中通/.test(t)) return "zto.png"
-  if (/圆通/.test(t)) return "yto.png"
-  if (/韵达/.test(t)) return "yunda.png"
-  if (/申通/.test(t)) return "sto.png"
-  if (/极兔/.test(t)) return "jtexpress.png"
-  if (/德邦/.test(t)) return "debang.png"
-  if (/百世/.test(t)) return "best.png"
-  if (/邮政|EMS/i.test(t)) return "china_post.png"
-  if (/DHL/i.test(t)) return "dhl.png"
-  if (/FedEx/i.test(t)) return "fedex.png"
-  if (/UPS/.test(t)) return "ups.png"
-  return undefined
+  const code = companyCode(hint)
+  return code ? COURIER_FILE[code] : undefined
 }
 
 function inferName(hint: string): string | undefined {
-  const t = hint ?? ""
-  if (/菜鸟/.test(t)) return "菜鸟驿站"
-  if (/丰巢|快递柜/.test(t)) return "丰巢"
-  if (/京东/.test(t)) return "京东物流"
-  if (/顺丰/.test(t)) return "顺丰速运"
-  if (/中通/.test(t)) return "中通快递"
-  if (/圆通/.test(t)) return "圆通速递"
-  if (/韵达/.test(t)) return "韵达快递"
-  if (/申通/.test(t)) return "申通快递"
-  if (/极兔/.test(t)) return "极兔速递"
-  if (/德邦/.test(t)) return "德邦快递"
-  return undefined
+  const code = companyCode(hint)
+  return code ? companyName(code) : undefined
 }
 
 /** 卡片第二行/图标兜底用的公司名（编号→中文名，猜不出就给「其他快递」） */
@@ -196,12 +173,26 @@ export interface CardModel {
 export function cardModelOf(item: any, stations?: any[]): CardModel {
   const code = Number(item?.companyName ?? item?.company ?? 0) || 0
   const hint = `${item?.address ?? ""} ${item?.courierStationName ?? ""} ${item?.smsContent ?? ""} ${item?.trackCompany ?? ""}`
-  const latestText = `${item?.trackLatest ?? ""}`.trim() || `${item?.notes ?? ""}`.trim()
+  // 菜鸟列表接口只给「运输中」这种粗状态，真正的文实在轨迹节点里：
+  // 文案就是个状态词、而节点里有句子时，卡片改显最新节点（用户问的就是这个）
+  const COARSE = /^(运输中|在途|在途中|已揽收|待揽收|已发货|派送中|已签收|已投递|待取件)$/
+  const latestRaw = `${item?.trackLatest ?? ""}`.trim() || `${item?.notes ?? ""}`.trim()
+  const nodeText = Array.isArray(item?.trackNodes) && item.trackNodes[0]?.text
+    ? `${item.trackNodes[0].text}`.trim()
+    : ""
+  const latestText = COARSE.test(latestRaw) && nodeText && nodeText !== latestRaw ? nodeText : latestRaw
   const awaiting = isAwaitingPickup(item)
   const done = Number(item?.status ?? 1) >= 2 || !!item?.pickedByUser
   const closedLabel = `${item?.closed ?? ""}`.trim()
   const delivering = /派送|派件|配送/.test(latestText)
   const preparing = /待发货|未发货|等待发货|备货|待成团|拼单中|待出库/.test(latestText)
+  // 异常/退回类节点：快递自己会报这种事，用户要的是一条红色警报，而不是普通「在途」。
+  // 这几种之外的在途一律只是信息（蓝色），不要把「运输中」当成状态标红。
+  const EXCEPTION = /退回|退件|拒收|拒签|异常|滞留|破损|丢失|损毁|超区|无法投递|派送失败|投递失败|无人接收|地址不详|联系不上|多次投递/
+  const exception = !String(item?.closed ?? "").trim() && !done && EXCEPTION.test(latestText)
+  // 退回类单拉出来：它和「破损/丢失」不是一回事，有自己的图标（包裹往回走）。
+  // 「退单 / 退款」是订单关闭，包裹没往回走 → 交给下面的红叉，所以词表在 model 里统一维护
+  const returning = isReturningText(closedLabel, latestText)
 
   // 没有真取件码时不要拿运单号冒充（中通这类代收点件常常只有运单号）
   const realCode = (() => {
@@ -216,19 +207,21 @@ export function cardModelOf(item: any, stations?: any[]): CardModel {
   const statusWord = done ? "已取件" : awaiting ? "暂无取件码" : "在途"
   const mainCode = closedLabel || realCode || (showLogistics ? latestText : statusWord)
 
-  // 状态图标：已关单=红叉（不论本地状态）、未发货=包裹盒、在途=卡车（蓝）、
-  // 配送中=骑手（橙）、已到站待取=圈、已取=勾
-  const statusIcon = closedLabel ? "xmark.circle.fill"
-    : done ? "checkmark.circle.fill"
-      : preparing ? "shippingbox"
-        : transitRow ? (delivering ? "scooter" : "truck.box")
-          : "checkmark.circle.fill"
-  const statusColor = closedLabel ? CLOSED_TINT
+  // 状态图标：退回=包裹往回走；其他异常/关单=红叉；未发货=包裹盒；待取=实心包裹盒；
+  // 在途=卡车（蓝）、派送中=电动车（橙）、已取=勾
+  const abnormal = !!closedLabel || exception || returning
+  const statusIcon = returning ? "shippingbox.and.arrow.backward"
+    : abnormal ? "xmark.circle.fill"
+      : done ? "checkmark.circle.fill"
+        : preparing ? "shippingbox"
+          : transitRow ? (delivering ? "moped" : "truck.box")
+            : "shippingbox.fill"
+  const statusColor = abnormal ? CLOSED_TINT
     : done ? C.tertiary
       : preparing ? C.tertiary
         : transitRow ? (delivering ? "#FF9500" : "#2D7BFF")
           : C.green
-  const codeColor = closedLabel
+  const codeColor = abnormal
     ? CLOSED_TINT
     : showLogistics ? (delivering ? "#FF9500" : "#2D7BFF")
       : (done ? C.tertiary : C.text)
@@ -346,8 +339,9 @@ export function ParcelCardRow({
             : null}
         </HStack>
         <HStack spacing={size === "app" ? 5 : 3} frame={{ maxWidth: "infinity", alignment: "leading" }}>
-          <AppBrandMark app={m.srcApp} size={s.mark} />
+          {/* 平台已经认领这单，就只显平台标；两个都画会出现两个一模一样的角标 */}
           <PlatformMark source={m.source} size={s.mark} />
+          {m.source ? null : <AppBrandMark app={m.srcApp} size={s.mark} />}
           <Text font={s.sub} foregroundStyle={subColor} lineLimit={1} truncationMode="tail">{m.subTitle}</Text>
         </HStack>
       </VStack>

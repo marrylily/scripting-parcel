@@ -7,6 +7,7 @@
  */
 import { addPickup, getPickups, updatePickup, type Pickup } from "../store"
 import { codeKey, mergeCodes } from "./codes"
+import { companyCode, companyCodeInText } from "../theme"
 import { parseDeliveryText, looksLikeStation, type ParsedPackage } from "./smsParse"
 
 export interface IntentItem {
@@ -211,7 +212,7 @@ function applyOne(it: IntentItem): { ok: boolean; note: string; addedMailNo?: st
     addPickup({
       code: p.code || "",
       codes: p.code ? [p.code] : [],
-      companyName: 1,
+      companyName: companyCode(p.company || "") || companyCodeInText(p.raw || ""),
       address: station,
       phone: "",
       notes: `快捷指令识别：${p.raw.slice(0, 60)}`,

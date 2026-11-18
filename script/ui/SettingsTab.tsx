@@ -40,11 +40,12 @@ export function SettingsTab({ revision, onOpen, onExit }: {
     const parts: string[] = []
     if (cache.packages > 0) parts.push(`${cache.packages} 个已取超过 30 天的包裹`)
     if (cache.intents > 0) parts.push(`${cache.intents} 条旧识别记录`)
+    if (cache.removed > 0) parts.push(`${cache.removed} 条删除记忆`)
     if (cache.files > 0) parts.push("诊断日志与图标副本")
     const ok = await Dialog.confirm({
       title: "清除缓存",
       message: parts.length
-        ? `将清理 ${parts.join("、")}，约 ${sizeText(cache.bytes)}。统计里的累计数会按剩下包裹重算；在途、待取的包裹、设置与授权不受影响。`
+        ? `将清理：${parts.join("、")}，约 ${sizeText(cache.bytes)}。\n\n同时清掉本机身份码缓存，统计里的累计数按剩下包裹重算；删除记忆清空后，之前删过的包裹可能被重新同步进来。在途、待取、设置与授权不受影响。`
         : "现在没有可清理的内容。",
       confirmLabel: "清理",
       cancelLabel: "取消",
@@ -55,6 +56,7 @@ export function SettingsTab({ revision, onOpen, onExit }: {
     const done: string[] = []
     if (freed.packages > 0) done.push(`${freed.packages} 个历史包裹`)
     if (freed.intents > 0) done.push(`${freed.intents} 条识别记录`)
+    if (freed.removed > 0) done.push(`${freed.removed} 条删除记忆`)
     if (freed.files > 0) done.push("日志与图标副本")
     notify(done.length ? `已清理 ${done.join("、")}，约 ${sizeText(freed.bytes)}` : "没有可清理的内容")
   }
@@ -115,7 +117,7 @@ export function SettingsTab({ revision, onOpen, onExit }: {
           </Card>
 
           <VStack spacing={4} frame={{ maxWidth: "infinity" }} padding={{ top: 28 }}>
-            <Text font={12} foregroundStyle={C.tertiary}>包裹助手 · 版本 1.2.0</Text>
+            <Text font={12} foregroundStyle={C.tertiary}>包裹助手 · 版本 1.2.1</Text>
           </VStack>
         </VStack>
       </ScrollView>

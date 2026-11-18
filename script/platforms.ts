@@ -6,20 +6,22 @@
  * 授权后的「同步包裹」在 sync.ts（复用聚合脚本的解析逻辑，同一套 Keychain key）。
  */
 declare const fetch: any
-import { safeDelay } from "./utils/safeTimer"
-const delay = (ms: number) => safeDelay(ms)
+const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
 
 // 解除授权用各平台自己的清理函数：它们除了删 Keychain，还会清 WebView 持久 Cookie 仓库，
 // 只删 Keychain 的话下次授权会被旧会话自动登录。
 import { jdClearLogin } from "./utils/jd"
 import { pddClearLogin } from "./utils/pdd"
+import { vipClearLogin, vipHasLogin } from "./utils/vip"
+import { dewuClearLogin, dewuHasLogin } from "./utils/dewu"
 import { clearIdentityCaches } from "./utils/identity"
+import { pddAuthMode } from "./utils/pddToken"
 
 // 登录页用 iPhone UA + 手机版 CSS 重画。实测结论：iPad UA 不会避免挤掉手机 App，
 // 挤下线是账号级会话替换，与设备端无关；既然无收益就回到已验证可用的手机形态。
 const SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
-export type PlatformId = "taobao" | "cainiao" | "jd" | "pdd" | "fengchao" | "kdniao" | "mi"
+export type PlatformId = "taobao" | "cainiao" | "jd" | "pdd" | "vip" | "dewu" | "fengchao" | "kdniao"
 
 // 快递鸟凭证 key（与 kdniao.ts 一致，避免循环导入）
 const CRED_KEY_KD = "kdniao.credential"
@@ -43,10 +45,12 @@ export const PLATFORMS: PlatformMeta[] = [
   { id: "cainiao", name: "菜鸟", icon: "identity/cainiao.png" },
   { id: "jd", name: "京东", icon: "identity/jd.png" },
   { id: "pdd", name: "拼多多", icon: "identity/pdd.jpg" },
+  // 唯品会：H5 登录（m.vip.com），订单走 mapi 网关直连，不用开网页
+  { id: "vip", name: "唯品会", icon: "identity/vip.png" },
+  // 得物：接口要原生签名，只能开订单页钩它自己发的请求（详见 utils/dewu.ts）
+  { id: "dewu", name: "得物", icon: "identity/dewu.png" },
   // 丰巢：快递柜的真实取件码来源，手机号+短信登录（原生表单，不走 WebView）
   { id: "fengchao", name: "丰巢", icon: "logos64/hive.png" },
-  // 小米快递：小米账号扫码登录（智能助理「我的快递」聚合，需再绑手机号）
-  { id: "mi", name: "小米快递聚合", icon: "identity/mi.png" },
 ]
 
 /* ---------------- 登录态存取（与聚合脚本同 key，可直接互认） ---------------- */
@@ -87,7 +91,6 @@ export function taobaoCookiesLoggedIn(): boolean {
 }
 
 import { fcClearLogin, fcHasLogin } from "./utils/fengchao"
-import { miClearLogin, miHasLogin } from "./utils/mi"
 
 /* ---------------- 淘宝 / 菜鸟的独立启停 -------------
  * 登录可以复用（同一个淘宝会话），但「解除授权」要各自独立：
@@ -131,19 +134,29 @@ export function sanitizeTaobaoAuth(): void {
 export function hasAuth(id: PlatformId): boolean {
   if (id === "kdniao") return !!loadCredentialSafe()
   if (id === "fengchao") return fcHasLogin()
-  if (id === "mi") return miHasLogin()
   // 菜鸟与淘宝共用淘宝登录态（同一套 Cookie 调 mtop）；淘宝已登录且没被单独关掉才算已授权
   // 光有 cookie 不算：登录页的匿名 cookie 会让人以为已授权，实际接口全是 SESSION_EXPIRED
   if (id === "cainiao") return taobaoCookiesLoggedIn() && platformEnabled("cainiao")
   if (id === "taobao") return taobaoCookiesLoggedIn() && platformEnabled("taobao")
   if (id === "jd") return readCookies(JD_KEY).some((c: any) => c.name === "pt_key" && !!c.value)
-  return readCookies(PDD_KEY).length > 0 || hasPddTokenLS()
+  if (id === "vip") return vipHasLogin()
+  if (id === "dewu") return dewuHasLogin()
+  if (id === "pdd") {
+    // Token 模式只认 PDDAccessToken：匿名 cookie 一堆但没 token 就是没授权，
+    // 以前“只要有 cookie 就算已授权”会让 Token 填错也显示成功
+    if (pddAuthMode() === "token") {
+      return readCookies(PDD_KEY).some((c: any) => c.name === "PDDAccessToken" && !!c.value)
+    }
+    return readCookies(PDD_KEY).length > 0 || hasPddTokenLS()
+  }
+  return false
 }
 
 export function clearAuth(id: PlatformId) {
+  // 解除授权 / 重新授权前先把组件侧连败退避清掉：否则刚重新登录成功，组件还会按旧退避停着
+  clearWidgetBackoff(id)
   if (id === "kdniao") { try { Keychain.remove(CRED_KEY_KD); Keychain.remove(TOKEN_KEY_KD) } catch { } return }
   if (id === "fengchao") { fcClearLogin(); return }
-  if (id === "mi") { miClearLogin(); return }
   // 淘宝 / 菜鸟：只关掉自己那路，不删 Cookie（另一路还要用）。
   // 两个都被关掉时才清 Cookie，避免残留登录态。
   if (id === "taobao" || id === "cainiao") {
@@ -157,6 +170,8 @@ export function clearAuth(id: PlatformId) {
     return
   }
   if (id === "jd") { jdClearLogin(); return }
+  if (id === "vip") { vipClearLogin(); return }
+  if (id === "dewu") { dewuClearLogin(); return }
   if (id === "pdd") { pddClearLogin(); return }
 }
 
@@ -175,29 +190,13 @@ function hostOf(u: any): string {
 
 /* ---------------- 登录页修版脚本（照搬聚合脚本的已验证版） ---------------- */
 
-/** 京东：顶部导航栏盖住 116pt，把整页推下去 */
-const JD_LOGIN_FIX = `(function(){
-  var CSS = [
-    'html,body{height:auto!important;min-height:100%!important;overflow-y:auto!important;',
-    '-webkit-overflow-scrolling:touch!important;background:#fff!important;}',
-    'body{padding-top:calc(max(env(safe-area-inset-top, 0px), 96px) + 8px)!important;box-sizing:border-box!important;}',
-    '#app,.page{min-height:0!important;}',
-    'input{font-size:16px!important;}'
-  ].join('');
-  function apply(){
-    var st = document.getElementById('agent-jd-fix');
-    if(!st){ st = document.createElement('style'); st.id='agent-jd-fix'; (document.head||document.documentElement).appendChild(st); }
-    if(st.textContent !== CSS) st.textContent = CSS;
-  }
-  apply();
-  var n = 0, iv = setInterval(function(){ apply(); if(++n > 40) clearInterval(iv) }, 300);
-})()`
+/** 京东：顶部导航栏盖住 116pt，把整页推下去（实现在 utils/jd.ts，两处不要各写一套） */
 
 /** 拼多多：表单贴顶被导航栏盖住，改成垂直居中卡片 */
 // 用户实测结论（2026-11-14）：iPad UA / 平板指纹并不能避免挤掉手机 App——
 // 挤下线是账号级会话替换（网页登录 = 新会话，旧会话作废），与设备端无关。
 // 所以登录页只保留这一套已验证可用的手机版重画，不再区分形态。
-const PDD_LOGIN_FIX = `(function(){
+export const PDD_LOGIN_FIX = `(function(){
   var CSS = [
     'html,body{height:100%!important;overflow:hidden!important;background:#fff!important;}',
     '#login{background:#fff!important;}',
@@ -220,6 +219,7 @@ const PDD_LOGIN_FIX = `(function(){
     '#login .container .login-ui-form .agreement-wrap{margin-top:14px!important;font-size:12px!important;}'
   ].join('');
   function apply(){
+    if(!document.documentElement) return;
     var st = document.getElementById('agent-pdd-fix');
     if(!st){ st = document.createElement('style'); st.id='agent-pdd-fix'; (document.head||document.documentElement).appendChild(st); }
     if(st.textContent !== CSS) st.textContent = CSS;
@@ -232,98 +232,15 @@ const PDD_LOGIN_FIX = `(function(){
   apply();
   if(!window.__pddFixObserver){
     window.__pddFixObserver = new MutationObserver(function(){ if(!window.__pddFixTimer) window.__pddFixTimer=setTimeout(function(){ window.__pddFixTimer=0; apply() }, 100) });
-    window.__pddFixObserver.observe(document.documentElement, { childList:true, subtree:true });
+    try{ window.__pddFixObserver.observe(document.documentElement || document, { childList:true, subtree:true }) }catch(e){}
   }
   var n = 0, iv = setInterval(function(){ apply(); if(++n > 80) clearInterval(iv) }, 250);
 })()`
 
 /* ---------------- 三平台登录 ---------------- */
 
-async function loginTaobao(): Promise<string> {
-  // ephemeral：不预置旧 Cookie。否则重新授权时旧 unb 还在，一进页面就误判登录成功、弹窗秒退
-  const controller = new WebViewController({ ephemeral: true, preferredContentMode: "mobile" })
-  let presented = true
-  try {
-    // 照搬「快递聚合」的做法：不预置旧 Cookie、不比对 unb，登录后直接读全部 Cookie。
-    // （之前那版比对新旧 unb 值，同账号重新授权时永远不命中 → 明明登上了却报“没有拿到登录态”）
-    try { await controller.setCustomUserAgent(SAFARI_UA) } catch { }
-    controller.present({ fullscreen: true, navigationTitle: "登录淘宝" })
-      .then(() => { presented = false })
-      .catch(() => { presented = false })
-    try { await controller.loadURL("https://login.taobao.com/member/login.jhtml") } catch { }
 
-    const deadline = Date.now() + 8 * 60 * 1000
-    while (presented && Date.now() < deadline) {
-      await delay(900)
-      if (!presented) break
-      // 只有出现真登录凭证（unb/tracknick）才自动关；_tb_token_ 这类匿名 cookie 不算
-      if (await taobaoLoggedIn(controller)) break
-    }
-
-    const cookies = await controller.getAllCookies().catch(() => [])
-    const usable = (cookies || []).filter((c: any) => /taobao|tmall|alibaba/.test(String(c.domain || "")))
-    // 只认真正登录凭证：登录页本身就会下 _tb_token_/cookie2/cna 这类匿名 cookie，
-    // 拿「有 cookie」当成功会在用户直接关掉弹窗时误判（之后 mtop 一律 FAIL_SYS_SESSION_EXPIRED）。
-    const logged = await taobaoLoggedIn(controller)
-    if (presented) { try { controller.dismiss() } catch { } await delay(300) }
-    if (!logged) return "没有完成淘宝登录，请重新授权"
-    if (usable.length === 0) return "没有拿到淘宝 Cookie，登录可能没完成"
-    saveCookies(TB_KEY, usable)
-    return ""
-  } finally {
-    controller.dispose()
-  }
-}
-
-/** 淘宝是否真的登录了：unb（用户 id）/ tracknick（昵称）出现即算 */
-async function taobaoLoggedIn(controller: WebViewController): Promise<boolean> {
-  const cookies = await controller.getAllCookies().catch(() => [])
-  return (cookies || []).some((c: any) => ["unb", "tracknick"].includes(String(c.name)) && !!c.value)
-}
-
-async function loginJd(): Promise<string> {
-  // ephemeral：不预置旧 Cookie（旧 pt_key 预置进去会让页面直接当已登录，弹窗秒退 = 用户实测的 bug）
-  const controller = new WebViewController({ ephemeral: true, preferredContentMode: "mobile" })
-  let presented = true
-  try {
-    try { await controller.setCustomUserAgent(SAFARI_UA) } catch { }
-    try { await controller.addUserScript({ source: JD_LOGIN_FIX, injectionTime: "documentEnd" }) } catch { }
-    // 不再预置旧 Cookie（ephemeral 已隔离）
-    // 先弹窗再加载，避免点了没反应
-    controller
-      .present({ fullscreen: true, navigationTitle: "登录京东" })
-      .then(() => { presented = false })
-      .catch(() => { presented = false })
-    try {
-      await controller.loadURL("https://plogin.m.jd.com/login/login?appid=0&returnurl=https%3A%2F%2Fhome.m.jd.com%2FmyJd%2Fnewhome.action")
-    } catch { }
-
-    const deadline = Date.now() + 8 * 60 * 1000
-    while (presented && Date.now() < deadline) {
-      await delay(800)
-      if (!presented) break
-      const cs = await controller.getAllCookies().catch(() => [])
-      const host = hostOf((controller as any).url)
-      // 登录成功 = 页面回到了 jd.com 的普通页（不再是 plogin/passport），且拿到了 pt_key。
-      // 登录后的落地页是 home.m.jd.com/myJd，不是 my.m.jd.com——只认 my.m.jd.com 永远收不到（之前就卡在这）
-      const onJd = !!host && /(^|\.)jd\.com$/.test(host) && !/^(plogin|passport)\./.test(host)
-      const pt = cs.find((c: any) => c.name === "pt_key" && !!c.value)
-      if (pt && onJd) break
-    }
-
-    const cookies = await controller.getAllCookies().catch(() => [])
-    const pt = cookies.find((c: any) => c.name === "pt_key" && !!c.value)
-    // 有 pt_key 就算登录成功（同账号重授权时值和之前一样，不能拿“值变了”当成功条件）
-    const ok = !!pt
-    if (ok) saveCookies(JD_KEY, cookies)
-    if (presented) { try { controller.dismiss() } catch { } await delay(600) }
-    return ok ? "" : "没有拿到京东登录态（新设备常要滑块或短信验证），请重试"
-  } finally {
-    controller.dispose()
-  }
-}
-
-async function pddSessionReady(controller: WebViewController): Promise<boolean> {
+export async function pddSessionReady(controller: WebViewController): Promise<boolean> {
   // 只认真正的登录凭证：PDDAccessToken 或 localStorage 里的用户 token。
   // 不能拿「域是 pinduoduo|yangkeduo 的任意 Cookie」当登录成功——匿名页面也有一堆（api_uid 等），
   // 那样一进登录页就判成功，弹窗会立刻关掉。
@@ -336,7 +253,7 @@ async function pddSessionReady(controller: WebViewController): Promise<boolean> 
   return (cookies || []).some((c: any) => c && c.name === "PDDAccessToken" && !!c.value)
 }
 
-async function savePddSession(controller: WebViewController): Promise<number> {
+export async function savePddSession(controller: WebViewController): Promise<number> {
   const cookies = await controller.getAllCookies().catch(() => [])
   const usable = cookies.filter((c: any) => /pinduoduo|yangkeduo|pdd/.test(String(c.domain || "")))
   if (usable.length > 0) saveCookies(PDD_KEY, usable)
@@ -349,75 +266,46 @@ async function savePddSession(controller: WebViewController): Promise<number> {
   return usable.length
 }
 
-async function loginPdd(): Promise<string> {
-  // ephemeral：不预置旧 Cookie，重新授权时不会因为旧 token 还在而一进页面就误判成功
-  const controller = new WebViewController({ ephemeral: true, preferredContentMode: "mobile" })
-  let presented = true
-  const oldAuthed = hasAuth("pdd")
-  let saved = false
-  try {
-    // 平板形态：仅 setCustomUserAgent 不一定影响页面 JS 读到的 navigator.userAgent，
-    // 再用 documentStart 注入脚本强行覆盖一次，拼多多前端按 UA 分支渲染平板版登录页
-    try { await controller.setCustomUserAgent(SAFARI_UA) } catch { }
-    try { await controller.addUserScript({ source: PDD_LOGIN_FIX, injectionTime: "documentEnd" }) } catch { }
-    controller.present({ fullscreen: true, navigationTitle: "登录拼多多" })
-      .then(() => { presented = false })
-      .catch(() => { presented = false })
-    try { await controller.loadURL("https://mobile.yangkeduo.com/login.html") } catch {
-      // 只在页面真的没渲染出来时重试：已经能看到输入框就别重载，
-      // 否则用户刚点进输入框就被刷一下（原来固定 1.2 秒重载一次）
-      const rendered = String(await controller.evaluateJavaScript(
-        "return document.querySelectorAll('input').length").catch(() => "0") || "0")
-      if (rendered === "0") {
-        await delay(1500)
-        try { await controller.loadURL("https://mobile.yangkeduo.com/login.html") } catch { }
-      }
-    }
 
-    const deadline = Date.now() + 10 * 60 * 1000
-    while (presented && Date.now() < deadline) {
-      await delay(1200)
-      if (!presented) break
-      const host = hostOf((controller as any).url)
-      const leftLogin = !!host && /(yangkeduo|pinduoduo)\.(com|net)$/.test(host) && !/^login\./.test(host)
-      // 必须「确实拿到了登录凭证」才存、才关，不要在匿名页面边轮询边存（会把垃圾 Cookie 存成已授权）
-      if (leftLogin && await pddSessionReady(controller)) {
-        try { await savePddSession(controller) } catch { }
-        if (hasAuth("pdd")) { saved = true; break }
-      }
-    }
+/* ---------------- 登录态保存（内嵌登录页共用） ---------------- */
 
-    // 只有真的拿到登录凭证才落盘。之前这里无条件 savePddSession，匿名页面的
-    // Cookie 也会被存成「已授权」——用户解除授权后点授权、不登录直接关，立刻又显示已授权
-    if (saved) { try { await savePddSession(controller) } catch { } }
-    saved = saved && (readCookies(PDD_KEY).length > 0 || hasPddTokenLS())
-    if (presented) { try { controller.dismiss() } catch { } await delay(400) }
-    return saved && !oldAuthed ? "" : saved ? "" : "没有拿到拼多多登录态：输完验证码后等弹窗自动关闭，不要手动关"
-  } finally {
-    controller.dispose()
-  }
+/** 淘宝：有 unb/tracknick 就是登录了；同时把淘宝/天猫域名的 Cookie 存下来 */
+export async function taobaoSessionLogin(wv: WebViewController): Promise<boolean> {
+  const cookies = await wv.getAllCookies().catch(() => [])
+  const logged = (cookies || []).some((c: any) => ["unb", "tracknick"].includes(String(c.name)) && !!c.value)
+  if (!logged) return false
+  const usable = (cookies || []).filter((c: any) => /taobao|tmall|alibaba/.test(String(c.domain || "")))
+  if (usable.length > 0) saveCookies(TB_KEY, usable)
+  return true
 }
 
+/** 京东：pt_key 就是登录凭证（同账号重登录值不变，不能拿“值变了”当条件） */
+export async function jdSessionLogin(wv: WebViewController): Promise<boolean> {
+  const cookies = await wv.getAllCookies().catch(() => [])
+  const logged = (cookies || []).some((c: any) => String(c.name) === "pt_key" && !!c.value)
+  if (logged) saveCookies(JD_KEY, cookies)
+  return logged
+}
+
+/**
+ * 哪些平台的授权需要在登录页里完成（对应 ui/webLogin.tsx 的那几个 id）。
+ * 菜鸟是个例外：淘宝已登录时它只是“开关”，不需要再登一次。
+ */
+export function authNeedsPage(id: PlatformId): boolean {
+  if (id === "taobao" || id === "cainiao") return !(taobaoCookiesLoggedIn() && platformState(id)?.ok !== false)
+  // 拼多多 Token 模式走输入框，不进网页
+  if (id === "pdd") return true
+  return true
+}
+
+/** 不用登录页、直接当开关打开的情况（目前只有菜鸟复用淘宝身份） */
 export async function authorize(id: PlatformId): Promise<string> {
-  // 菜鸟没有自己的登录页：弹淘宝登录页，登完淘宝菜鸟自然已授权
-  if (id === "taobao" || id === "cainiao") {
-    // 已经有可用的淘宝身份（有 unb/tracknick 且上次不是“登录已失效”）→ 只当开关打开，不再弹登录
-    const stale = platformState(id)?.ok === false
-    if (taobaoCookiesLoggedIn() && !stale) {
-      setPlatformEnabled(id, true)
-      return ""
-    }
-    const err = await loginTaobao()
-    // 登录成功后只重新打开这一次授权的平台；被用户单独关掉的另一路保持关闭
-    if (!err) setPlatformEnabled(id, true)
-    return err
+  if ((id === "taobao" || id === "cainiao") && taobaoCookiesLoggedIn() && platformState(id)?.ok !== false) {
+    setPlatformEnabled(id, true)
+    return ""
   }
-  if (id === "jd") return loginJd()
-  // 丰巢是原生表单（手机号 + 验证码），由授权页直接 open("fengchaoLogin")，不走这里
-  if (id === "fengchao") return ""
-  // 小米：登录页是独立 sheet（弹 WebView 扫码），由授权页直接 open("miLogin")，不走这里
-  if (id === "mi") return ""
-  return loginPdd()
+  // 其余都应该走 ui/webLogin.tsx 的登录页
+  return "请在登录页完成授权"
 }
 
 
@@ -448,6 +336,24 @@ export function markPlatform(id: PlatformId, ok: boolean, reason?: string) {
   const all = readStates()
   all[id] = { ok, at: Date.now(), reason: ok ? undefined : reason }
   try { Storage.set(STATE_KEY, JSON.stringify(all)) } catch { }
+  if (ok) clearWidgetBackoff(id)
+}
+
+/**
+ * 组件侧的“连败退避”存在 cc/widgetTasks.json 的 fail 里。
+ * 用户重新授权或本轮同步成功时把它清掉，否则重新登录后组件还会按旧退避停着不动。
+ * 这里直接改文件，不 import widgetTasks，避开循环依赖。
+ */
+function clearWidgetBackoff(id: PlatformId) {
+  try {
+    const f = `${FileManager.appGroupDocumentsDirectory}/cc/widgetTasks.json`
+    if (!FileManager.existsSync(f)) return
+    const s = JSON.parse(FileManager.readAsStringSync(f) || "{}") || {}
+    if (s.fail && s.fail[id]) {
+      delete s.fail[id]
+      FileManager.writeAsStringSync(f, JSON.stringify(s))
+    }
+  } catch { }
 }
 
 /** 有 Cookie 但上次同步报登录失效 */

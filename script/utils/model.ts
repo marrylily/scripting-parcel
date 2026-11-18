@@ -5,7 +5,7 @@ export interface Pkg {
   /** 平台内订单号；拼多多带 pdd: 前缀，京东带 jd: 前缀 */
   orderId: string
   /** 来源平台；manual 表示手动搜索添加的运单号 */
-  source?: "taobao" | "pdd" | "jd" | "manual" | "fengchao" | "mi"
+  source?: "taobao" | "pdd" | "jd" | "manual" | "fengchao" | "mi" | "vip" | "dewu" | "cainiao"
   /** 商品标题 */
   itemTitle: string
   /** 店铺名 */
@@ -134,6 +134,15 @@ export function sourceOf(p: any): "taobao" | "jd" | "pdd" | undefined {
   return undefined
 }
 
+/** 包裹在往回走：退回 / 退件 / 退货 / 拒收 / 拒签…（卡片用「回退包裹」图标）。
+ *  注意：「退单」「退款」「交易关闭」是**订单**关了，包裹不一定动，那是红叉，别并进来。 */
+export const RETURNING_RE = /退回|退件|退货|拒收|拒签|返件|退运|原路退回|拦截退回/
+
+/** 包裹是不是在往回走（卡片用回退包裹图标；「退单 / 退款」不算） */
+export function isReturningText(...texts: (string | undefined | null)[]): boolean {
+  return RETURNING_RE.test(texts.filter(Boolean).join(" "))
+}
+
 /** 订单已关闭：退款 / 退货 / 取消 / 交易关闭。
  *  只能拿订单状态或最新节点判，不能拿整页正文（页面上永远有「申请退款」按钮）。 */
 export function closedOrderStatus(text: string): Pkg["status"] | undefined {
@@ -143,6 +152,20 @@ export function closedOrderStatus(text: string): Pkg["status"] | undefined {
   if (/退款成功|退款完成|已退款|全额退款|交易关闭|交易已关闭|订单关闭|订单已关闭|订单取消|订单已取消|已取消订单|退货退款中|退货退款成功|退货中|退货完成|退货成功|退单成功/.test(value)) return "cancelled"
   if (/^(已取消|已退货|退款中|退款处理中|等待退款|退款申请中|售后退款中)$/.test(value)) return "cancelled"
   return undefined
+}
+
+/** 多段文案一起判状态：取信号最强的一个（已退款 > 已签收 > 未发货 > 在途）。
+ *  实测坑：拼多多/京东老单的「最新节点」可能还停在「已存放至驿站」，
+ *  而官方状态字段写的是已签收；只看节点就会把早就签收的历史单当在途重新导入。 */
+const STATUS_RANK: Record<Pkg["status"], number> = { cancelled: 6, delivered: 5, unshipped: 4, transit: 3, none: 1 }
+export function classifyAny(...texts: (string | undefined | null)[]): Pkg["status"] {
+  let best: Pkg["status"] = "none"
+  for (const t of texts) {
+    if (!t) continue
+    const s = classify(String(t))
+    if (STATUS_RANK[s] > STATUS_RANK[best]) best = s
+  }
+  return best
 }
 
 /** 把官方物流文案归类成四种状态：已签收 / 未发货 / 在途 / 无物流 */

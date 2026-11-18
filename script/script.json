@@ -1,5 +1,5 @@
 {
-  "description": "ParcelPal 1.2.10 remote-update edition. Resolves H5 order-page loading upon commit when Ultron data is ready, and automatically transitions picked-up parcels from awaiting pickup to picked up across Taobao, Cainiao, Fengchao, and courier tracks.",
+  "description": "ParcelPal 1.2.11 remote-update edition. Merges upstream Vipshop/Dewu/PDD-Token/WebLogin updates, fixes widget background auto-sync and immediate desktop refresh without opening Scripting, resolves Taobao H5 commit early-readiness, and auto-transitions picked-up parcels.",
   "remoteDefinitionId": null,
   "name": "包裹助手（远程更新）",
   "iconImage": null,
@@ -12,7 +12,7 @@
   "entry": "index.tsx",
   "icon": "shippingbox.fill",
   "color": "rgba(124, 76, 179,1)",
-  "version": "1.2.10",
+  "version": "1.2.11",
   "contributors": [],
   "runInApp": false,
   "remoteResource": {
@@ -20,8 +20,8 @@
     "autoUpdateInterval": 3600
   },
   "localizedDescriptions": {
-    "zh": "1.2.10 远程更新版：1) 淘宝 H5 订单页在 commit 后检测到订单数据立即完成加载；2) 驿站/快递柜取件后（菜鸟 SIGN、丰巢出柜、淘宝及各快递出库签收文案）自动从「待取」转为「已取」。",
-    "en": "1.2.10 remote-update edition. Completes Taobao H5 order-page loading upon commit when Ultron data is ready, and automatically transitions picked-up parcels from awaiting pickup to picked up."
+    "zh": "1.2.11 远程更新版：1) 完整合入原作者新版（新增唯品会/得物、拼多多 Token 免顶号登录、防遮挡内嵌登录页、删除记忆等）；2) 修复桌面小组件后台自动同步新单/取件码/物流并在变化后立即刷新桌面（无需点进 Scripting）；3) 保留淘宝 H5 commit 秒开与驿站/快递柜取件自动转已取。",
+    "en": "1.2.11 remote-update edition. Merges upstream updates, fixes widget background auto-sync and immediate desktop reload, and preserves Taobao H5 commit early-readiness and auto-pickup transitions."
   },
   "localizedNames": {
     "en": "ParcelPal (remote updates)",

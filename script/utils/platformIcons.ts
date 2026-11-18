@@ -7,6 +7,8 @@ const SRC: Record<string, string> = {
   taobao: "identity/taobao.png",
   jd: "identity/jd.png",
   pdd: "identity/pdd.jpg",
+  vip: "identity/vip.png",
+  dewu: "identity/dewu.png",
   fengchao: "logos64/hive.png",
 }
 
@@ -78,20 +80,38 @@ const NAME_KEY: Record<string, string> = {
 
 const DIR = () => `${FileManager.appGroupDocumentsDirectory}/cc/platform`
 
+/**
+ * 缩略图 44px 就够：角标最大 14pt，3 倍屏也只要 42px。
+ * 别为了「更清晰」烤成 132px——多 9 倍像素，体积和组件里的解码内存都涨，肉眼看不出来。
+ */
+const ICON_PX = 44
+/** 图标烤焙版本：换了某个平台的图标就 +1，下次启动会重烤共享目录里的小图 */
+const ICON_VER = 2
+const ICON_VER_KEY = "cc.platformIcons.ver"
+const fileOf = (key: string) => `${DIR()}/${key}.png`
+/** 曾经烤过 132px 的那版（key-132.png）：只读兼容，有就用，没有拉倒 */
+const bigOf = (key: string) => `${DIR()}/${key}-132.png`
+
 /** App 启动时跑一次；已存在就跳过（新增的 key 下次启动会自动补） */
 export function syncPlatformIcons(): void {
   try {
     const dir = DIR()
     if (!FileManager.existsSync(dir)) FileManager.createDirectorySync(dir, true)
     const all: Record<string, string> = { ...SRC, ...BRAND_SRC }
+    // 资产里的图换过了（比如唯品会换新 logo）：旧烤图不会自动更新，先删再烤
+    const ver = Number(Storage.get<number>(ICON_VER_KEY) ?? 0) || 0
+    if (ver !== ICON_VER) {
+      for (const key of Object.keys(all)) { try { FileManager.removeSync(fileOf(key)) } catch { } }
+      try { Storage.set(ICON_VER_KEY, ICON_VER) } catch { }
+    }
     for (const key of Object.keys(all)) {
-      const dst = `${dir}/${key}.png`
-      if (FileManager.existsSync(dst)) continue
+      const dst = fileOf(key)
+      if (FileManager.existsSync(dst) || FileManager.existsSync(bigOf(key))) continue
       const src = `${Script.directory}/assets/${all[key]}`
       if (!FileManager.existsSync(src)) continue
       const img = UIImage.fromFile(src)
       if (!img) continue
-      const small = img.preparingThumbnail({ width: 44, height: 44 }) ?? img
+      const small = img.preparingThumbnail({ width: ICON_PX, height: ICON_PX }) ?? img
       const data = small.toPNGData()
       if (data) FileManager.writeAsDataSync(dst, data)
     }
@@ -102,8 +122,10 @@ export function syncPlatformIcons(): void {
 export function platformIconPath(source?: string): string {
   const key = source && SRC[source] ? source : ""
   if (!key) return ""
-  const path = `${DIR()}/${key}.png`
-  try { return FileManager.existsSync(path) ? path : "" } catch { return "" }
+  try {
+    for (const p of [fileOf(key), bigOf(key)]) if (FileManager.existsSync(p)) return p
+  } catch { }
+  return ""
 }
 
 /** 来源 App（bundle id 或名字）→ 共享目录里的图标路径；认不出返回空串 */
@@ -112,6 +134,8 @@ export function appBrandIconPath(app?: { id?: string; name?: string }): string {
   const nm = String(app?.name ?? "").trim()
   const key = (id && BUNDLE_KEY[id]) || (nm && NAME_KEY[nm]) || ""
   if (!key) return ""
-  const path = `${DIR()}/${key}.png`
-  try { return FileManager.existsSync(path) ? path : "" } catch { return "" }
+  try {
+    for (const p of [fileOf(key), bigOf(key)]) if (FileManager.existsSync(p)) return p
+  } catch { }
+  return ""
 }

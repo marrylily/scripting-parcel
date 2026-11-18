@@ -10,18 +10,16 @@ import { CompanyLogo, PickupRow } from "./PickupRow"
 import { IdentityCodeSheet, IdentityEntrySettings } from "./identity"
 import { QrLoginPage } from "./qrLogin"
 import { PddMobileSection, loadPddMobiles } from "./pddMobiles"
+import { pddAuthorize } from "../utils/pddAuth"
+import { pddAuthMode } from "../utils/pddToken"
+import { FengchaoLoginPushed } from "./fengchaoLogin"
+import { WebLoginPushed, type WebLoginId } from "./webLogin"
 import { TrackDetailPage, TrackSearchSheet } from "./trackSearch"
 import { KdniaoLoginPage } from "./kdLogin"
 import { clearCredential, clearToken, loadCredential, loadUser, refreshUser } from "../kdniao"
-import { authorize, clearAuth, hasAuth, markPlatform, needsReauth, platformEnabled, PLATFORMS, syncPlatformParcels, type PlatformId } from "../platforms"
-import { readFullSyncAt, platformLastSyncedAt, platformLastError, miPhones, clearPlatformLastError, platformSyncHint } from "../utils/platformSync"
-import { safeDelay } from "../utils/safeTimer"
-import { MANUAL_SYNC_MS, sanitizeSyncMessage, summarizeReport } from "../utils/syncSafety"
+import { authNeedsPage, authorize, clearAuth, hasAuth, markPlatform, needsReauth, platformEnabled, PLATFORMS, syncPlatformParcels, type PlatformId } from "../platforms"
+import { readFullSyncAt, platformLastSyncedAt, platformLastError } from "../utils/platformSync"
 import { notify } from "./notify"
-import { FengchaoLoginPage } from "./fengchaoLogin"
-import { MiLoginPage } from "./miLogin"
-import { resolveMiLoginUrl } from "./miLoginHelper"
-import { miHasLogin, miMintToken, miReadUser, miSaveSession } from "../utils/mi"
 import { PlatformDetailPage } from "./platformDetail"
 import { ToastHost } from "./toast"
 import { assetImage } from "./assets"
@@ -45,6 +43,9 @@ import {
 type Closer = () => void
 type Opener = (kind: string, props?: any) => void
 
+/** 快捷指令模板的 iCloud 分享链接：点开就能装（本地文件分享那条路别人要先开「允许不受信任」） */
+const SHORTCUT_LINK = "https://www.icloud.com/shortcuts/4f22bb07251d44e8b18da977e729f8e2"
+
 function InfoPage({ title, rows, close }: { title: string; rows: [string, string, string][]; close: Closer }) {
   return (
     <SubPage title={title} onClose={close}>
@@ -63,7 +64,7 @@ export function FaqPage({ close }: { close: Closer }) {
     {
       title: "取件码",
       items: [
-        ["取件码是从哪来的？", "三处：平台授权同步（淘宝、菜鸟、京东、拼多多、丰巢、小米快递），各走自己的订单与物流接口；短信或截图识别，本机 OCR 加规则解析；搜索运单号查询，先走菜鸟，没结果才用快递鸟兜底。"],
+        ["取件码是从哪来的？", "三处：平台授权同步（淘宝、菜鸟、京东、拼多多、丰巢），各走自己的订单与物流接口；短信或截图识别，本机 OCR 加规则解析；搜索运单号查询，先走菜鸟，没结果才用快递鸟兜底。"],
         ["为什么有的包裹没有取件码？", "部分快递由驿站或代收点代签，平台只回运单号不返码。到站后可以在包裹列表右上角点 ＋ 、用运单号再查一次，或者直接到驿站报手机尾号取。"],
         ["「在途」和「暂无取件码」有什么区别？", "在途 = 还没到站；暂无取件码 = 已经到站，但这单没有可用的取件码。"],
         ["一个包裹有好几个取件码？", "卡片主码右边会把另一个一并列出，取件时不会丢信息。"],
@@ -74,8 +75,8 @@ export function FaqPage({ close }: { close: Closer }) {
       title: "同步与授权",
       items: [
         ["某个平台同步失败怎么办？", "打开「设置 → 账号授权 → 该平台」，失败原因写在那一页：未登录、需要在页面里验证、请求过多被限制、未绑定取件手机号，和别处看到的是同一句话。"],
-        ["为什么淘宝、京东、拼多多要在 App 里才能同步？", "它们靠内嵌网页拿订单与物流，必须有界面。桌面组件也会按「全量轮转」逐个平台查新订单，但每次唤醒只能跑一小段（预算 3 秒、一次最多两个平台）；App 打开时会一次翻完，更快。"],
-        ["多久同步一次？", "间隔在「设置 → 刷新频率」里改：前台刷新、组件刷新、全量发现新订单、失败冷却四项。打开 App 或手动下拉会让淘宝等网页平台也参与同步；点「立即同步」不受间隔限制。"],
+        ["淘宝、京东、拼多多在组件里也能同步吗？", "能。它们靠内嵌网页拿订单与物流，组件扩展里也能开网页（实测可用）；只是每次唤醒只做一件联网的事，单个平台预算 18 秒。京东一单一个跟踪页，组件每次只跑 3 单，剩下的下次继续（冷启动时 App 一次翻完，更快）。"],
+        ["多久同步一次？", "间隔在「设置 → 刷新频率」里改：前台刷新、组件重建、组件数据刷新、全量发现新订单、失败冷却。组件补单跟随「前台刷新」、全量轮转跟随「新订单」那个小时数，不会比 App 更勤。手动下拉随时可以拉。"],
         ["已签收或已退款的包裹为什么不见了？", "已签收超过 7 天的不再导入；退款、取消、退货是终态，卡片上会直接写「已退款」。"],
         ["淘宝和菜鸟要分别授权吗？", "共用一次淘宝登录：解除其中一个，那一项就显示未授权、不再读它的数据；两个都解除才清掉登录，下次要重新登。"],
       ],
@@ -98,7 +99,7 @@ export function FaqPage({ close }: { close: Closer }) {
     {
       title: "快捷指令",
       items: [
-        ["怎么把截图交给包裹助手？", "三种：控制中心点一下（会自动收起控制中心再截屏）、在别的 App 里把图片分享给这个快捷指令、短信自动化。"],
+        ["怎么把截图交给包裹助手？", "三种：加到控制中心后点一下（自动收起控制中心、截屏当前订单页）、在别的 App 里把图片分享给这个快捷指令、短信自动化。截图不用你手动做。"],
         ["会打扰我吗？", "成功不打扰：只写进「识别记录」，下次打开 App 自动落库。只有识别失败、或取件码对不上需要你选包裹时才发通知。"],
         ["卡片上的平台名和图标是哪来的？", "快捷指令会带上「当前 App」的标识：认得出就显示那个平台的图标和名字，认不出就退回快递公司名。搜索运单号添加的包裹没有平台，只显示快递公司名。"],
       ],
@@ -107,7 +108,7 @@ export function FaqPage({ close }: { close: Closer }) {
       title: "数据与隐私",
       items: [
         ["数据存在哪？会传出去吗？", "只存在本机（App Group），不上传任何服务器。联网只做三件事：查物流时把运单号发给菜鸟、各平台自己的接口或快递鸟；手动查单需要自动判断快递公司时问一下快递100；同步平台订单时用你自己的授权。"],
-        ["清除缓存会删掉包裹吗？", "会删已取超过 30 天的历史包裹（连同轨迹与提醒），统计里的累计数重置为剩下包裹的数量，本机留着的身份码缓存也会清掉。在途、待取、设置和授权都不动。"],
+        ["清除缓存会删掉包裹吗？", "会。已取超过 30 天的历史包裹（连同轨迹与提醒）会被删掉，旧识别记录、身份码缓存、诊断日志与图标副本也会清掉，统计里的累计数按剩下包裹重算。另外「删除记忆」会清空：之前手动删掉的包裹，下一轮平台同步可能又被导回来。在途、待取、设置和授权都不动。"],
         ["卸载 Scripting 或删掉脚本会怎样？", "本机数据会跟着一起没有，无法恢复。重要包裹请提前截图留底。"],
       ],
     },
@@ -735,14 +736,28 @@ function AddLocationPage({ close, bump }: { close: Closer; bump: Closer }) {
 }
 
 // ---------------- 账号授权 ----------------
-/** 同一页上新的一次手动同步会取代上一次；旧调用的 finally 不能把新按钮收回。 */
-let manualSyncEpoch = 0
 function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; open: Opener }) {
   const [busy, setBusy] = useState<PlatformId | null>(null)
   const [rev, setRev] = useState(0)
   const [syncing, setSyncing] = useState(false)
   const [kdTick, setKdTick] = useState(0)
   const [mobBusy, setMobBusy] = useState(false)
+  // 行内「授权」按钮用全屏模态打开登录页：关闭就回到这一页，不碰页面栈
+  async function presentLoginPage(pid: PlatformId) {
+    try {
+      await Navigation.present({
+        modalPresentationStyle: "fullScreen",
+        element: (
+          <NavigationStack>
+            {pid === "fengchao"
+              ? <FengchaoLoginPushed bump={bump} />
+              : <WebLoginPushed key={pid} id={pid as WebLoginId | "cainiao"} bump={bump} />}
+          </NavigationStack>
+        ),
+      } as any)
+    } catch { }
+    setRev(r => r + 1); bump()
+  }
   const [kdMsg, setKdMsg] = useState("")
   // 同步状态只活在这一页：进页重置、离页清空，不在返回后残留
   const [syncText, setSyncText] = useState("")
@@ -752,36 +767,31 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
     setSyncErr("")
     return () => { setSyncText(""); setSyncErr("") }
   }, [])
+  // 页面开着时每 20 秒重算一次：同步时间、失效原因都是直接读存储，
+  // 不主动触发重渲染就会停在进页那一刻（看起来像必须退出再进）
+  useEffect(() => {
+    const t = setInterval(() => setRev(r => r + 1), 20_000)
+    return () => clearInterval(t)
+  }, [])
 
   async function runSync(only?: string[]) {
-    const epoch = ++manualSyncEpoch
+    if (syncing) return
     setSyncing(true)
     setSyncErr("")
     setSyncText("准备中…")
     try {
-      clearPlatformLastError(only && only.length ? only : PLATFORMS.map(p => p.id))
-      if (epoch === manualSyncEpoch) setRev(r => r + 1)
-      // 预算仍是 MANUAL_SYNC_MS。页面加载用 WebView 官方超时，结束后这里一定会收回按钮。
+      // 手动同步给 120 秒预算：撞上排队页时不至于无限挂着（自动全量 60s / 组件 18s）
       // only：授权完某平台后只同步它，不连累其它平台
-      const report = await syncPlatformParcels((t) => {
-        if (epoch === manualSyncEpoch) setSyncText(t || "同步中…")
-      }, { force: true, preempt: true, deadline: Date.now() + MANUAL_SYNC_MS, only })
-      if (epoch !== manualSyncEpoch) return
+      await syncPlatformParcels((t) => setSyncText(t || "同步中…"), { force: true, deadline: Date.now() + 120_000, only })
       bump()
       setRev(r => r + 1)
-      // 单平台失败时 syncPlatformParcels 不会抛错，必须把结论写到按钮右侧，避免仍显示「尚未同步」且没有任何错误。
-      const summary = summarizeReport((report as any)?.results)
-      if (summary) setSyncErr(summary)
     } catch (e: any) {
-      if (epoch !== manualSyncEpoch) return
       // 错误写在行右侧，不再弹气泡（避免和行内文案重复）
-      setSyncErr(sanitizeSyncMessage(String(e?.message ?? e), 48) || "同步失败")
+      setSyncErr(String(e?.message ?? e).slice(0, 24))
     } finally {
-      if (epoch === manualSyncEpoch) {
-        setSyncing(false)
-        setSyncText("")
-        setRev(r => r + 1)
-      }
+      setSyncing(false)
+      setSyncText("")
+      setRev(r => r + 1)
     }
   }
 
@@ -791,10 +801,12 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
   return (
     <SubPage title="账号授权" onClose={close}>
       <Section title="授权电商平台"
-        footer="淘宝与菜鸟共用同一个淘宝登录态：单独解除只停对应数据并显示未授权，两路都解除才清登录；已有登录态时点授权只当开关，缺身份才弹登录。">
+        footer="淘宝与菜鸟共用同一个淘宝登录态：单独解除只停对应数据并显示未授权，两路都解除才清登录；已有登录态时点授权只当开关，缺身份才弹登录。得物要开订单页同步（较慢，约 9 秒），小组件预算不够时会跳过、下次再补。">
         {PLATFORMS.map(p => {
           const authed = hasAuth(p.id)
           const expired = needsReauth(p.id)
+          // 登录页必须在当前栈里真 push：行内 open() 会替换路由，返回会直接退回首页
+          const pageAuth = authNeedsPage(p.id) && !(p.id === "pdd" && pddAuthMode() === "token")
           return (
             // 真正的原生 push：系统管返回手势与层级，返回回授权页而不是退到一级页。
             // 按钮是行内快捷操作（解授权/快登），不触发 push。
@@ -817,17 +829,16 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
                       return err ? `登录已失效：${err.msg.slice(0, 20)}` : "登录已失效，需重新授权"
                     }
                     if (!authed) return "未授权"
-                    // 配置缺失不必等同步失败才报：这就是它在详情页里的失败原因
-                    if (p.id === "mi" && miPhones().length === 0) return "已授权 · 未绑定取件手机号"
+                    const err = platformLastError(p.id)
                     const last = platformLastSyncedAt(p.id)
-                    const hint = platformSyncHint(p.id)
-                    if (hint?.kind === "error") return `已授权 · 同步失败：${hint.msg.slice(0, 30)}`
-                    if (hint?.kind === "skip") return `已授权 · 已跳过：${hint.msg.slice(0, 30)}`
+                    const fresh = err && Date.now() - err.at < 3 * 3_600_000
+                    if (fresh) return `已授权 · 同步失败：${err!.msg.slice(0, 30)}`
                     if (last > 0) return `已授权 · 上次同步 ${hmText(last)}`
                     return "已授权"
                   })()}
                 </Text>
               </VStack>
+              {/* pageLogin 平台未授权时不在这里放按钮：行内 open() 会弄坏返回栈，走详情页真 push */}
               <Button title={expired ? "重新授权" : authed ? "解除授权" : "授权"}
                 buttonStyle={authed && !expired ? "bordered" : "borderedProminent"}
                 tint={authed && !expired ? C.red : C.accent}
@@ -840,71 +851,21 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
                     setRev(r => r + 1); bump()
                     return
                   }
+                  // 需要登录页的：push 当前栈里的登录页（不是 open）
+                  if (pageAuth) { await presentLoginPage(p.id); return }
                   setBusy(p.id)
                   try {
-                    // 丰巢：原生手机号+验证码表单（RSA 签名的接口登录）
-                    if (p.id === "fengchao") { open("fengchaoLogin"); setBusy(null); return }
-                    // 小米：照其它平台一样，点授权直接弹 WebView 登录页，成功自动关
-                    if (p.id === "mi") {
-                      setBusy(null)
-                      const controller = new WebViewController({ ephemeral: true, preferredContentMode: "desktop" })
-                      let presented = true
-                      try {
-                        controller.present({ fullscreen: true, navigationTitle: "登录小米账号" })
-                          .then(() => { presented = false })
-                          .catch(() => { presented = false })
-                        const { resolveMiLoginUrl } = await import("./miLoginHelper")
-                        const url = await resolveMiLoginUrl()
-                        try { await controller.loadURL(url) } catch { }
-                        const deadline = Date.now() + 10 * 60 * 1000
-                        let ok = false
-                        while (presented && Date.now() < deadline) {
-                          await safeDelay(2000)
-                          if (!presented) break
-                          const cur = String((controller as any).url || "")
-                          const done = cur.includes("fe/service/account")
-                            || cur.includes("passInfo=login-end")
-                            || cur.startsWith("https://api.assistant.miui.com/sts")
-                          if (!done) continue
-                          const cookies: any[] = await controller.getAllCookies().catch(() => [])
-                          const pick = (name: string) => cookies.find((c: any) => c.name === name && !!c.value)?.value
-                          let token = pick("assistant_serviceToken") ?? pick("serviceToken")
-                          const cUserId = pick("cUserId") ?? ""
-                          const passToken = pick("passToken")
-                          const userId = pick("userId")
-                          const deviceId = pick("deviceId")
-                          if (token) {
-                            miSaveSession(token, { cUserId, passToken: passToken ?? "", userId: userId ?? "", deviceId: deviceId ?? "" })
-                            ok = true
-                            break
-                          }
-                          if (passToken && userId && deviceId) {
-                            miSaveSession("", { passToken, userId, deviceId })
-                            try {
-                              const mint = await miMintToken()
-                              miSaveSession(mint.token, { ...miReadUser(), cUserId: mint.cUserId, passToken, userId, deviceId })
-                              ok = true
-                              break
-                            } catch (e: any) {
-                              notify(String(e?.message ?? e).slice(0, 40), "error")
-                            }
-                          }
-                        }
-                        if (presented) { try { controller.dismiss() } catch { } await safeDelay(400) }
-                        if (ok && miHasLogin()) {
-                          markPlatform("mi", true)
-                          notify("小米账号登录成功")
-                          setRev(r => r + 1); bump()
-                          void runSync(["mi"])
-                        } else if (!presented && !miHasLogin()) {
-                          notify("小米登录未完成，请重试", "warn")
-                        }
-                      } finally {
-                        try { controller.dispose() } catch { }
+                    let err = ""
+                    if (p.id === "pdd") {
+                      // 拼多多：网页 / Token 由用户选的授权方式决定，和详情页同一入口
+                      const r = await pddAuthorize()
+                      if (!r.ok) {
+                        if (r.canceled) return
+                        err = r.message
                       }
-                      return
+                    } else {
+                      err = await authorize(p.id)
                     }
-                    const err = await authorize(p.id)
                     if (err) notify(err, "warn")
                     else {
                       markPlatform(p.id, true)
@@ -927,7 +888,7 @@ function AuthorizePage({ close, bump, open }: { close: Closer; bump: Closer; ope
         })}
       </Section>
 
-      <Section title="同步" footer="打开 App 会按「刷新频率」里的间隔自动拉；手动同步无视间隔，用约 3 分钟预算把所有平台翻一遍（含京东）。页面卡住会按步骤超时返回，按钮会收回。">
+      <Section title="同步" footer="打开 App 会按「刷新频率」里的间隔自动拉；「立即同步」不看间隔，用 120 秒预算把所有已授权平台过一遍。">
         <Button buttonStyle="plain" disabled={syncing} frame={{ maxWidth: "infinity", alignment: "leading" }} contentShape="rect"
           action={() => void runSync()}>
           <HStack spacing={12} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
@@ -988,20 +949,26 @@ function hmText(t: number): string {
   const d = new Date(t)
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
 }
-/** "08:00-22:00" → { open, close } 时间戳；缺省 08:00 / 22:00 */
-function parseRange(s: string): { open: number; close: number } {
+/** "08:00-22:00" 或 "08:00-12:00, 14:00-22:00" → 一到两段时间戳
+ *  （有些驿站中午闭门，营业时间得登记成两段）*/
+function parseRanges(s: string): { open: number; close: number }[] {
   const all = (s ?? "").match(/\d{1,2}:\d{2}/g) ?? []
   const toTs = (v: string | undefined, fallback: [number, number]) => {
     const m = (v ?? "").match(/(\d{1,2}):(\d{2})/)
     return m ? atTime(Number(m[1]), Number(m[2])) : atTime(fallback[0], fallback[1])
   }
-  return { open: toTs(all[0], [8, 0]), close: toTs(all[1] ?? all[0], [22, 0]) }
+  if (all.length >= 4) {
+    return [
+      { open: toTs(all[0], [8, 0]), close: toTs(all[1], [12, 0]) },
+      { open: toTs(all[2], [14, 0]), close: toTs(all[3], [22, 0]) },
+    ]
+  }
+  return [{ open: toTs(all[0], [8, 0]), close: toTs(all[1] ?? all[0], [22, 0]) }]
 }
 
 function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
   const [rev, setRev] = useState(0)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [name, setName] = useState("")
   const [kws, setKws] = useState("")
   const [addr, setAddr] = useState("")
   const [phone, setPhone] = useState("")
@@ -1009,7 +976,13 @@ function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
   const [confirmDel, setConfirmDel] = useState<string | null>(null)
   const [openAt, setOpenAt] = useState(() => atTime(8, 0))
   const [closeAt, setCloseAt] = useState(() => atTime(22, 0))
+  // 第二段（中午休息后再开一段）：老数据只有一段，读的时候 parseRanges 自动识别
+  const [seg2, setSeg2] = useState(false)
+  const [open2At, setOpen2At] = useState(() => atTime(14, 0))
+  const [close2At, setClose2At] = useState(() => atTime(21, 0))
   const [hoursTouched, setHoursTouched] = useState(false)
+  // 取件页那个驿站标题旁的小字，开关就从这里开
+  const [showHome, setShowHome] = useState(false)
   const [notes, setNotes] = useState("")
   const list = getStations()
   const act = (fn: () => void) => { fn(); bump(); setRev(rev + 1) }
@@ -1018,56 +991,92 @@ function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
   const fill = (s: CourierStation) => {
     setEditingId(s.courierStationUuid)
     setConfirmDel(null)
-    setName(s.courierStationName)
     setKws((s.keywords ?? []).join("、"))
     setAddr(s.address)
     setPhone((s.phones ?? []).length > 0 ? (s.phones ?? []).join("、") : (s.phone || ""))
     setHours(s.businessHours || "")
-    const r = parseRange(s.businessHours)
-    setOpenAt(r.open)
-    setCloseAt(r.close)
+    const rs = parseRanges(s.businessHours)
+    setOpenAt(rs[0].open)
+    setCloseAt(rs[0].close)
+    setSeg2(rs.length > 1)
+    setOpen2At(rs[1]?.open ?? atTime(14, 0))
+    setClose2At(rs[1]?.close ?? atTime(21, 0))
     setHoursTouched(false)
+    setShowHome(s.showOnHome === true)
     setNotes(s.notes)
   }
   const reset = () => {
-    setEditingId(null); setName(""); setKws(""); setAddr("")
+    setEditingId(null); setKws(""); setAddr("")
     setPhone(""); setHours(""); setNotes("")
+    setSeg2(false); setHoursTouched(false)
+    setShowHome(false)
+  }
+  /** 时间选择器 → 存盘文案：一段 "09:00-21:00"；两段 "09:00-12:00, 14:00-21:00" */
+  const hoursText = () => {
+    const a = `${hmText(openAt)}-${hmText(closeAt)}`
+    return seg2 ? `${a}, ${hmText(open2At)}-${hmText(close2At)}` : a
   }
   // 关键词/手机号支持逗号、分号、顿号、空格分隔
   const parseList = (v: string) => v.split(/[,，、;；\s]+/).map(x => x.trim()).filter(x => x.length > 0)
   const save = () => {
-    if (!editingId || !name.trim()) return
+    if (!editingId) return
     const cleanPhones = parseList(phone)
+    // 名称不在这里改（点列表里那个名字改），避免旧名字又写回去
     act(() => updateStation(editingId, {
-      courierStationName: name.trim(), keywords: parseList(kws),
+      keywords: parseList(kws),
       phones: cleanPhones, phone: cleanPhones[0] ?? "",
       address: addr.trim(), notes: notes.trim(),
-      businessHours: hoursTouched ? `${hmText(openAt)}-${hmText(closeAt)}` : hours,
+      // 只要动过开关/时间，或者本来就有文案，就按选择器归一化后存；空着且没动过就继续空着
+      businessHours: (hoursTouched || seg2 || hours.trim()) ? hoursText() : "",
+      showOnHome: showHome,
     }))
     reset()
   }
-  // 加号：先落地一个默认驿站，再展开让用户直接填
-  const addNew = () => {
-    const created = addStation({ courierStationName: "新驿站", keywords: [], phones: [], phone: "", address: "", businessHours: "", notes: "" })
+  // 加号：先问名字，建好直接展开编辑其余字段
+  const addNew = async () => {
+    const v = await Dialog.prompt({
+      title: "新建驿站", message: "取件页按驿站分组时会用这个名字", placeholder: "例如：菜鸟驿站(龙湖天街店)",
+      confirmLabel: "创建", cancelLabel: "取消",
+    }).catch(() => null)
+    const next = String(v ?? "").trim()
+    if (!next) return
+    const created = addStation({ courierStationName: next, keywords: [], phones: [], phone: "", address: "", businessHours: "", notes: "" })
     bump()
     setRev(rev + 1)
     fill(created)
   }
 
+  // 点列表里那个驿站名直接改名（不再单独占一行「名称」输入框）
+  const renameStation = async (s: CourierStation) => {
+    const v = await Dialog.prompt({
+      title: "重命名驿站",
+      message: "取件页的驿站标题会一起改",
+      placeholder: s.courierStationName,
+      defaultValue: s.courierStationName,
+      selectAll: true,
+      confirmLabel: "保存",
+      cancelLabel: "取消",
+    }).catch(() => null)
+    const next = String(v ?? "").trim()
+    if (!next || next === s.courierStationName) return
+    act(() => updateStation(s.courierStationUuid, { courierStationName: next }))
+  }
+
   const rows: any[] = []
   // 表单行里 Button 会被当成「尾部附件」居中，改用手势文本才能均分整行
-  const saveEnabled = name.trim().length > 0
+  const saveEnabled = !!editingId
   const vline = (k: string) => <VStack key={k} frame={{ width: 1, height: 18 }} background={{ style: C.separator, shape: RR(1) }} />
   // 表单行内可用宽：屏宽减表单/卡片内缩；两个操作均分，分割线才会画满整行
   const actW = Math.floor((Math.min(Device.screen.width, 430) - 74) / 2)
   // 左标签 + 右输入的编辑行（TextField 的 title 填上后会顶掉标题，只能自己排）
-  const fieldRow = (key: string, label: string, value: string, set: (v: string) => void, hint: string, kb?: any) => (
+  const fieldRow = (key: string, icon: string, tint: any, label: string, value: string, set: (v: string) => void, hint: string, kb?: any) => (
     <HStack key={key} spacing={10} frame={{ maxWidth: "infinity" }} padding={{ vertical: 2 }}>
+      <Icon name={icon} size={16} color={tint} />
       <Text font={16} foregroundStyle={C.text}>{label}</Text>
       <Spacer />
       <TextField title="" prompt={hint} value={value} onChanged={set}
         multilineTextAlignment="trailing" keyboardType={kb}
-        frame={{ maxWidth: 210 }} />
+        frame={{ maxWidth: 200 }} />
     </HStack>
   )
   for (const s of list) {
@@ -1088,7 +1097,8 @@ function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
         <HStack spacing={12} padding={{ vertical: 4 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
           <Icon name="building.2.fill" size={20} color={C.blue} />
           <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" }}>
-            <Text font={16} foregroundStyle={C.text} lineLimit={1}>{s.courierStationName || "未命名驿站"}</Text>
+            <Text font={16} foregroundStyle={C.text} lineLimit={1} contentShape="rect"
+              onTapGesture={() => void renameStation(s)}>{s.courierStationName || "未命名驿站"}</Text>
             <Text font={12} foregroundStyle={C.tertiary} lineLimit={1}>
               {kwList.length > 0
                 ? kwList.join("、")
@@ -1102,22 +1112,14 @@ function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
     if (open) {
       // 编辑区：基本信息 → 其他 → 操作行（删除/保存同一行）
       rows.push(
-        fieldRow(`${s.courierStationUuid}-name`, "名称", name, setName, "驿站名称"),
-        fieldRow(`${s.courierStationUuid}-kw`, "关键词", kws, setKws, "多个用顿号分隔"),
+        fieldRow(`${s.courierStationUuid}-kw`, "tag.fill", C.accent, "关键词", kws, setKws, "多个用顿号分隔"),
       )
-      // 把解析结果回显，用户能直接看到会被哪几个词命中
-      if (parseList(kws).length > 0) {
-        rows.push(
-          <Text key={`${s.courierStationUuid}-kwout`} font={12} foregroundStyle={C.tertiary} lineLimit={2} padding={{ vertical: 2 }}>
-            {`将匹配：${parseList(kws).join(" · ")}`}
-          </Text>
-        )
-      }
       rows.push(
-        fieldRow(`${s.courierStationUuid}-addr`, "地址", addr, setAddr, "选填"),
-        fieldRow(`${s.courierStationUuid}-phone`, "手机号", phone, setPhone, "多个用顿号分隔", "numbersAndPunctuation"),
-        <HStack key={`${s.courierStationUuid}-hours`} spacing={6} frame={{ maxWidth: "infinity" }} padding={{ vertical: 2 }}>
-          <Text font={16} foregroundStyle={C.text}>{"营业时间"}</Text>
+        fieldRow(`${s.courierStationUuid}-addr`, "mappin.circle.fill", C.blue, "地址", addr, setAddr, "选填"),
+        fieldRow(`${s.courierStationUuid}-phone`, "phone.fill", C.green, "手机号", phone, setPhone, "多个用顿号分隔", "numbersAndPunctuation"),
+        <HStack key={`${s.courierStationUuid}-hours`} spacing={10} frame={{ maxWidth: "infinity" }} padding={{ vertical: 2 }}>
+          <Icon name="clock.fill" size={16} color={C.orange} />
+          <Text font={16} foregroundStyle={C.text}>{seg2 ? "上午" : "营业时间"}</Text>
           <Spacer />
           <DatePicker title="" value={openAt} displayedComponents={["hourAndMinute"]}
             datePickerStyle="compact" labelsHidden
@@ -1127,7 +1129,26 @@ function StationPage({ close, bump }: { close: Closer; bump: Closer }) {
             datePickerStyle="compact" labelsHidden
             onChanged={(v: number) => { setCloseAt(v); setHoursTouched(true) }} />
         </HStack>,
-        fieldRow(`${s.courierStationUuid}-notes`, "备注", notes, setNotes, "选填"),
+        // 中午闭门的驿站：再开一段，存成 "09:00-12:00, 14:00-21:00"
+        <Toggle key={`${s.courierStationUuid}-seg2`} title="分时段营业" value={seg2}
+          onChanged={(v: boolean) => { setSeg2(v); setHoursTouched(true) }} />,
+        seg2 ? (
+          <HStack key={`${s.courierStationUuid}-hours2`} spacing={10} frame={{ maxWidth: "infinity" }} padding={{ vertical: 2 }}>
+            <Icon name="clock.fill" size={16} color={C.orange} />
+            <Text font={16} foregroundStyle={C.text}>{"下午"}</Text>
+            <Spacer />
+            <DatePicker title="" value={open2At} displayedComponents={["hourAndMinute"]}
+              datePickerStyle="compact" labelsHidden
+              onChanged={(v: number) => { setOpen2At(v); setHoursTouched(true) }} />
+            <Text font={15} foregroundStyle={C.secondary}>{"–"}</Text>
+            <DatePicker title="" value={close2At} displayedComponents={["hourAndMinute"]}
+              datePickerStyle="compact" labelsHidden
+              onChanged={(v: number) => { setClose2At(v); setHoursTouched(true) }} />
+          </HStack>
+        ) : null,
+        fieldRow(`${s.courierStationUuid}-notes`, "note.text", C.tertiary, "备注", notes, setNotes, "选填"),
+        <Toggle key={`${s.courierStationUuid}-showhome`} title="取件页显示营业时间与地址" value={showHome}
+          onChanged={(v: boolean) => setShowHome(v)} />,
         <HStack key={`${s.courierStationUuid}-ops`} spacing={0} frame={{ maxWidth: "infinity" }} padding={{ vertical: 2 }}
           listRowSeparator={{ visibility: "hidden", edges: "bottom" }}>
           <Text font={16} fontWeight="semibold" foregroundStyle={C.red} frame={{ width: actW }} multilineTextAlignment="center"
@@ -1188,7 +1209,7 @@ function StationDetailPage({ name, close, open, bump }: { name: string; close: C
       <Section title="驿站信息">
         {s.address ? <Row icon="mappin.circle.fill" iconColor={C.blue} title="地址" detail={s.address} value="导航"
           onTap={() => { void Safari.openURL(`http://maps.apple.com/?q=${encodeURIComponent(s.address)}`) }} /> : null}
-        {s.businessHours ? <Row icon="clock.fill" iconColor={C.orange} title="营业时间" detail={s.businessHours} chevron={false} /> : null}
+        {s.businessHours ? <Row icon="clock.fill" iconColor={C.orange} title="营业时间" detail={s.businessHours.replace(/,\s*/g, " · ")} chevron={false} /> : null}
         {(s.keywords ?? []).length > 0
           ? <Row icon="tag.fill" iconColor={C.accent} title="关键词" detail={(s.keywords ?? []).join("、")} chevron={false} />
           : null}
@@ -1240,7 +1261,6 @@ function RefreshRatePage({ close, bump }: { close: Closer; bump: Closer }) {
   const [appMin, setAppMin] = useState(s.refreshAppMin)
   const [widgetMin, setWidgetMin] = useState(s.refreshWidgetMin)
   const [existingMin, setExistingMin] = useState(s.refreshExistingMin)
-  const [rotateMin, setRotateMin] = useState(s.fullRotateMin)
   const [fullHours, setFullHours] = useState(s.fullSyncHours)
   const [coolMin, setCoolMin] = useState(s.failCoolMin)
 
@@ -1260,30 +1280,20 @@ function RefreshRatePage({ close, bump }: { close: Closer; bump: Closer }) {
           () => { const v = Math.min(120, appMin + 5); setAppMin(v); saveSettings({ refreshAppMin: v }); bump() },
           () => { const v = Math.max(5, appMin - 5); setAppMin(v); saveSettings({ refreshAppMin: v }); bump() })} 
       </Section>
-      <Section title="小组件" footer="倍数关系：数据刷新 ≥ 2×重建，全量轮转 ≥ 3×重建且大于数据刷新；一次重建只做一件联网的事。">
+      <Section title="小组件" footer="倍数关系：数据刷新 ≥ 2×重建；组件重建一次只做一件联网的事（全量轮转 / 数据刷新 二选一）。">
         {stepRow("重建间隔", `${widgetMin} 分钟`,
           () => {
             const v = Math.min(180, widgetMin + 5)
-            // 倍数约束：数据刷新 ≥ 2×，全量轮转 ≥ 3×（且严格大于数据刷新）
             const e = Math.max(existingMin, v * 2)
-            const r = Math.max(rotateMin, Math.max(v * 3, e + 5))
-            setWidgetMin(v); setExistingMin(e); setRotateMin(r)
-            saveSettings({ refreshWidgetMin: v, refreshExistingMin: e, fullRotateMin: r }); bump()
+            setWidgetMin(v); setExistingMin(e)
+            saveSettings({ refreshWidgetMin: v, refreshExistingMin: e }); bump()
           },
           () => { const v = Math.max(5, widgetMin - 5); setWidgetMin(v); saveSettings({ refreshWidgetMin: v }); bump() })}
         {stepRow("数据刷新", `${existingMin} 分钟`,
-          () => {
-            const v = Math.min(120, existingMin + 5)
-            const r = Math.max(rotateMin, v + 5)
-            setExistingMin(v); setRotateMin(r)
-            saveSettings({ refreshExistingMin: v, fullRotateMin: r }); bump()
-          },
+          () => { const v = Math.min(120, existingMin + 5); setExistingMin(v); saveSettings({ refreshExistingMin: v }); bump() },
           () => { const v = Math.max(widgetMin * 2, existingMin - 5); setExistingMin(v); saveSettings({ refreshExistingMin: v }); bump() })}
-        {stepRow("全量轮转", `${rotateMin} 分钟`,
-          () => { const v = Math.min(240, rotateMin + 5); setRotateMin(v); saveSettings({ fullRotateMin: v }); bump() },
-          () => { const v = Math.max(existingMin + 5, widgetMin * 3, rotateMin - 5); setRotateMin(v); saveSettings({ fullRotateMin: v }); bump() })} 
       </Section>
-      <Section title="全量同步" footer="每个平台最多每隔这么久查一次新订单；App 与组件共用同一个“该平台刚查过”的时间戳，组件按「全量轮转」逐个平台查，不会重复请求。全部平台失败时按「冷却时间」重试，不会白等一个周期。">
+      <Section title="全量同步" footer="每个平台最多每隔这么久查一次新订单。App 与组件共用同一个「该平台刚查过」的时间戳，组件按这个间隔逐个平台轮转，不会重复请求；全部平台失败时按「冷却时间」重试，不会白等一个周期。">
         {stepRow("新订单", `${fullHours} 小时`,
           () => { const v = Math.min(12, fullHours + 1); setFullHours(v); saveSettings({ fullSyncHours: v }); bump() },
           () => { const v = Math.max(1, fullHours - 1); setFullHours(v); saveSettings({ fullSyncHours: v }); bump() })} 
@@ -1464,10 +1474,30 @@ function LivePreviewCard({ style }: { style: string }) {
 /** 短信自动化里可以填的触发词。取件短信里至少会命中一个。 */
 const KWS = ["包裹", "快递", "取件码"]
 
+/** 能力行展开后的步骤：缩进到图标右边，读起来像它的子项 */
+function CapSteps({ steps, footer }: { steps: string[]; footer?: string }) {
+  return (
+    <VStack alignment="leading" spacing={6} padding={{ leading: 45, trailing: 12, vertical: 4 }}
+      frame={{ maxWidth: "infinity", alignment: "leading" }}>
+      {steps.map((s, i) => (
+        <HStack key={i} spacing={8} alignment="top">
+          <Text font={12} fontWeight="semibold" foregroundStyle={C.accent}>{i + 1}.</Text>
+          <Text font={13} foregroundStyle={C.secondary}
+            frame={{ maxWidth: "infinity", alignment: "leading" }}>{s}</Text>
+        </HStack>
+      ))}
+      {footer ? <Text font={12} foregroundStyle={C.tertiary}>{footer}</Text> : null}
+    </VStack>
+  )
+}
+
 export function ShortcutsPage({ close, bump, linkIntentId }: { close: Closer; bump: Closer; linkIntentId?: string }) {
   const [draft, setDraft] = useState("")
   const [out, setOut] = useState("")
   const [, setRev] = useState(0)
+  // 能力行：点开哪一行就展开哪一行的教程，同时只开一个
+  const [openCap, setOpenCap] = useState<"" | "ocr" | "sms" | "share">("")
+  const toggleCap = (k: "ocr" | "sms" | "share") => setOpenCap(v => (v === k ? "" : k))
   const records = loadIntentInbox().slice(0, 10)
 
   const copyKw = () => {
@@ -1499,10 +1529,10 @@ export function ShortcutsPage({ close, bump, linkIntentId }: { close: Closer; bu
     return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
   }
 
-  const importShortcut = async (file: string) => {
-    const p = `${Script.directory}/assets/shortcuts/${file}`
-    if (!FileManager.existsSync(p)) { notify("文件缺失，请重新安装", "error"); return }
-    try { await ShareSheet.present([p]) } catch { notify("无法打开分享面板", "error") }
+  const importShortcut = async () => {
+    // 走 iCloud 分享链接：系统把它当可信来源，点开就能装；
+    // 分享本地文件那条路别人得先开「允许不受信任的快捷指令」，已经不用了
+    try { await Safari.openURL(SHORTCUT_LINK) } catch { notify("无法打开链接", "error") }
   }
 
   const test = () => {
@@ -1519,25 +1549,48 @@ export function ShortcutsPage({ close, bump, linkIntentId }: { close: Closer; bu
 
   return (
     <SubPage title="快捷指令与自动化" onClose={close}>
-      <Section title="能力" footer="识别在本机完成，不联网。">
-        <Row icon="camera.viewfinder" title="截屏识别" detail="不需要截屏，快捷指令自己截" chevron={false} />
-        <Row icon="text.bubble.fill" title="短信识别" detail="需先在「快捷指令」里建信息自动化" chevron={false} />
-        <Row icon="square.and.arrow.down" title="分享图片" detail="分享面板把截图直接传给包裹助手" chevron={false} />
+      <Section title="能力" footer="点一行展开设置步骤；识别在本机完成，不联网。">
+        <Row icon="camera.viewfinder" title="截屏识别" detail="控制中心点一下，自动截屏订单页并识别"
+          onTap={() => toggleCap("ocr")} />
+        {openCap === "ocr"
+          ? <CapSteps steps={[
+            "快捷指令详情页 → 添加到控制中心",
+            "打开订单页（任何 App 都行，包含没接入的平台）",
+            "控制中心点一下：自动收起 → 截屏 → 识别入库",
+          ]} />
+          : null}
+
+        <Row icon="text.bubble.fill" title="短信识别" detail="取件短信自动入库，需先建信息自动化"
+          onTap={() => toggleCap("sms")} />
+        {openCap === "sms"
+          ? <>
+            <CapSteps steps={[
+              "快捷指令 → 自动化 → 新建个人自动化",
+              `触发条件：信息包含 ${KWS.join("、")}`,
+              "动作：运行快捷指令 → 包裹助手智能识别",
+              "关闭「运行前询问」",
+            ]} footer="驿站 App 的推送通知不是短信，不会触发。" />
+            <Button title="复制触发词" systemImage="doc.on.doc" action={copyKw} />
+          </>
+          : null}
+
+        <Row icon="square.and.arrow.down" title="分享图片" detail="相册里的截图分享给快捷指令就能识别"
+          onTap={() => toggleCap("share")} />
+        {openCap === "share"
+          ? <CapSteps steps={[
+            "快捷指令详情 → 在共享表单中显示",
+            "相册或任意 App 里点分享",
+            "选「包裹助手·智能识别」：跑完自动识别入库",
+          ]} />
+          : null}
       </Section>
 
-      <Section title="导入快捷指令" footer="导入即可用：短信自动收录，截屏自动识别，不打开 App。">
+      <Section title="导入快捷指令" footer="导入后加到控制中心：订单页点一下就会自动截屏识别，不用打开 App。">
         {/* 导入是动作不是说明：用系统按钮，别写成一行灰字让人以为只是介绍 */}
         <Button title="点击导入「包裹助手·智能识别」" systemImage="square.and.arrow.down"
-          action={() => void importShortcut("包裹助手·智能识别.shortcut")} />
+          action={() => void importShortcut()} />
         <Row icon="bolt.fill" title="打开快捷指令 App" chevron={false}
           onTap={() => { void Safari.openURL("shortcuts://") }} />
-      </Section>
-
-      <Section title="短信自动化" footer="驿站 App 的推送通知不是短信，不会触发。">
-        <Row icon="1.circle.fill" title="快捷指令 → 自动化 → 新建个人自动化" chevron={false} />
-        <Row icon="2.circle.fill" title="触发条件：信息" detail={`包含 ${KWS.join("、")} · 点此复制`} onTap={copyKw} chevron={false} />
-        <Row icon="3.circle.fill" title="动作：运行快捷指令" detail="包裹助手智能识别" chevron={false} />
-        <Row icon="4.circle.fill" title="关闭「运行前询问」" chevron={false} />
       </Section>
 
       <Section title="试一试" footer="粘贴取件短信，识别后写入列表。">
@@ -1572,7 +1625,7 @@ export function ShortcutsPage({ close, bump, linkIntentId }: { close: Closer; bu
                     notify(msg)
                     setRev(x => x + 1)
                     bump()
-                  }} />,
+                  }} />
                 ] : []),
                 <Button key="del" title="删除" role="destructive" action={() => dropRecord(r.id)} />,
               ],
@@ -1678,9 +1731,8 @@ function routeInner(k: string, p: any, ctx: { close: Closer; bump: Closer; open:
   if (k === "identityCode") return <IdentityCodeSheet id={p.id ?? "taobao"} close={close} open={open} />
   if (k === "qrLogin") return <QrLoginPage close={close} bump={bump} />
   if (k === "authorize") return <AuthorizePage close={close} bump={bump} open={open} />
-  if (k === "fengchaoLogin") return <FengchaoLoginPage close={close} bump={bump}
-    onDone={() => void syncPlatformParcels(undefined, { only: ["fengchao"], force: true, preempt: true }).catch(() => { })} />
-  if (k === "miLogin") return <MiLoginPage close={close} bump={bump} />
+  // 丰巢 / 唯品会 / 得物的登录页已改成平台详情页里真 push（NavigationLink），
+  // 旧路由删掉：open() 建的三级页返回会直接退回首页
   // pddMobiles 已并入平台详情页（PddMobileSection），旧路由删掉
   if (k === "nickname") return <NicknamePage close={close} bump={bump} />
   if (k === "station") return <StationPage close={close} bump={bump} />

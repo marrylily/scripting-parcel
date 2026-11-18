@@ -1,7 +1,8 @@
 // 拼多多快递（mdkd）只读接口：驿站待取件（含取件码）、按运单号查物流。
 // 协议按 huverse/SuperXD 的 lib/toolbox/express 独立重写，只用官方 H5 本来的请求形状：
 // 不带 anti-content —— 这两个接口官方页面本身也不带（绑定/解绑那类账号变更才要，我们不碰）。
-import { getPickups, savePickups } from "../store"
+import { addPickup, getPickups, matchStation, updatePickup, type Pickup } from "../store"
+import { companyCode } from "../theme"
 import { codeKey, mergeCodes, normalizePickupCode } from "./codes"
 import { pddCookieHeader, pddHasLogin } from "./pdd"
 import { pddAntiContent } from "./pddAnti"
@@ -31,6 +32,8 @@ export type PddStationItem = {
   address: string
   orderSn: string
   sourceType: string
+  /** 这件寄给哪个绑定的号（官方字段 mobile_alias，形如「尾号0000」），取不到是空串 */
+  mobileAlias: string
 }
 
 export type PddStationResult = {
@@ -46,6 +49,10 @@ export type PddTrackResult = {
   forecast: string
   // 这件寄到哪个手机号的尾号（物流接口的 package_info 写「尾号5678 的快递」），取不到是空串
   ownerTail: string
+  // 官方最新状态文案（没有就是空串）：有它比从节点猜更准
+  latest: string
+  // 官方状态码（TRANSIT / SIGN 之类），没有就空串
+  statusCode: string
   nodes: { time: string; text: string }[]
 }
 
@@ -191,6 +198,7 @@ export async function pddStationPackages(stationCode = ""): Promise<PddStationRe
         address,
         orderSn: str(jump.order_sn),
         sourceType: str(jump.source_type ?? p?.source_type),
+        mobileAlias: str(p?.mobile_alias ?? p?.mobile_alias_desc ?? ""),
       })
     }
   }
@@ -230,6 +238,8 @@ export async function pddTrack(mailNo: string, extra?: { orderSn?: string; sourc
     mailNo: str(s?.tracking_number) || mailNo,
     forecast: fc && typeof fc === "object" ? str(fc.time_forecast_desc) : "",
     ownerTail: /尾号\s*(\d{3,4})/.exec(str(s?.package_info))?.[1] ?? "",
+    latest: str(s?.status_desc ?? s?.latest_desc ?? s?.status_text ?? s?.package_status_desc),
+    statusCode: str(s?.status_code ?? s?.status),
     nodes: traces.map(t => ({ time: str(t?.time), text: str(t?.info ?? t?.desc) })).filter(n => n.text),
   }
 }
@@ -274,31 +284,85 @@ export async function pddIdentityCode(stationCode = ""): Promise<{ code: string;
   }
 }
 
-/** 把驿站待取件的取件码合并进本地包裹：只按单号匹配、只追加，不覆盖已有码。返回改动条数。 */
-export async function applyPddPickupCodes(): Promise<number> {
-  if (!pddHasLogin()) return 0
+/* ---------------- 把驿站待取件导成普通包裹 ---------------- */
+
+/** 官方 mobile_alias 形如「尾号0000」或「138****0000」；取最后一段 3–4 位数字当尾号 */
+function tailOf(alias: string): string {
+  const runs = (alias || "").match(/[0-9]{3,4}/g) || []
+  return runs.length > 0 ? runs[runs.length - 1] : ""
+}
+
+export type PddImportResult = { imported: number; updated: number }
+
+/**
+ * 驿站待取件（含绑定的其他手机号寄来的）→ 包裹页。
+ *
+ * 官方这份数据只有「已到站、有取件码」的件，没有商品名，所以新建卡片的标题写成「尾号9717包裹」。
+ * 本地已有同一运单号的卡片则只补码/补驿站/补公司，不新建、不改状态。
+ *
+ * 注意：这里直接走 addPickup，不经过平台同步的 upsert，所以 shouldDropPkg 那套历史单拦截不会把它们挡掉——
+ * 到站件本来就是待取状态，不存在“已签收历史单”的问题。
+ */
+export async function importPddStationPackages(): Promise<PddImportResult> {
+  const none = { imported: 0, updated: 0 }
+  if (!pddHasLogin()) return none
   const r = await pddStationPackages().catch(() => null)
-  if (!r || r.items.length === 0) return 0
-  const map: Record<string, string[]> = {}
+  if (!r || r.items.length === 0) return none
+  let imported = 0
+  let updated = 0
   for (const it of r.items) {
     const no = codeKey(it.mailNo)
-    if (!no || !it.pickCode) continue
-    map[no] = [...(map[no] ?? []), it.pickCode]
+    if (!no) continue
+    const hit = getPickups().find(p => p.mailNo && codeKey(p.mailNo) === no)
+    if (hit) {
+      const patch: Partial<Pickup> = {}
+      const merged = mergeCodes(hit.codes ?? (hit.code ? [hit.code] : []), it.pickCode)
+      if (merged.length > (hit.codes?.length ?? (hit.code ? 1 : 0))) {
+        patch.codes = merged
+        if (!hit.code && merged[0]) patch.code = merged[0]
+      }
+      if (it.station && !hit.courierStationName) patch.courierStationName = it.station
+      if (it.address && !hit.address) patch.address = it.address
+      if (it.shippingName && !hit.trackCompany) patch.trackCompany = it.shippingName
+      if (it.orderSn && !hit.orderId) patch.orderId = `pdd:${it.orderSn}`
+      // 件还在驿站里躺着，就不能算已取（除非用户自己点过已取）
+      if (hit.status === 2 && !hit.pickedByUser) patch.status = 1
+      if (Object.keys(patch).length > 0) {
+        updatePickup(hit.uuid, patch)
+        updated++
+      }
+      continue
+    }
+    const tail = tailOf(it.mobileAlias)
+    const station = it.station ? matchStation(it.station) : null
+    addPickup({
+      // 官方不给商品名：用「尾号xxxx包裹」，跟用户约定一致
+      itemTitle: tail ? `尾号${tail}包裹` : "拼多多包裹",
+      code: it.pickCode,
+      codes: it.pickCode ? [it.pickCode] : [],
+      companyName: companyCode(it.shippingName || ""),
+      address: it.address || it.station || "",
+      phone: "",
+      notes: "",
+      status: 1,
+      type: "delivery",
+      smsContent: "",
+      courierStationName: station?.name || it.station || "",
+      courierStationUuid: station?.uuid || "",
+      mailNo: it.mailNo,
+      trackCompany: it.shippingName || "",
+      trackLatest: "包裹已到达驿站，待取件",
+      trackNodes: [],
+      // 0 让下一次刷新直接去拉真轨迹，而不是相信这句占位文案
+      trackUpdatedAt: 0,
+      source: "pdd",
+      orderId: it.orderSn ? `pdd:${it.orderSn}` : `pdd:${no}`,
+      // 已经到站了，才能进取件页、参与到站提醒
+      arrivedAt: Date.now(),
+    } as any)
+    imported++
   }
-  if (Object.keys(map).length === 0) return 0
-  const list = getPickups()
-  let changed = 0
-  const next = list.map(p => {
-    const no = codeKey(p.mailNo || "")
-    const incoming = no ? map[no] : undefined
-    if (!incoming) return p
-    const merged = mergeCodes(p.codes ?? (p.code ? [p.code] : []), ...incoming)
-    if (merged.length === (p.codes?.length ?? (p.code ? 1 : 0))) return p
-    changed++
-    return { ...p, code: merged[0] ?? p.code, codes: merged.length > 1 ? merged : undefined }
-  })
-  if (changed > 0) savePickups(next)
-  return changed
+  return { imported, updated }
 }
 
 /* ---------------- 取件手机号绑定（本人实时操作） ---------------- */

@@ -6,15 +6,15 @@
 // 我们只加载官方页并调它的生成器，不计算、不重放、不伪造任何字段。
 import { Button, HStack, Image, Menu, ProgressView, Text, TextField, VStack, useEffect, useState, Section as NativeSection } from "scripting"
 import { C, alpha } from "../theme"
-import { FormActions, InputLine, Row, Section, SectionHeader } from "./kit"
+import { FormActions, Icon, InputLine, Row, Section, SectionHeader } from "./kit"
 import { notify } from "./notify"
 import {
   pddBoundMobiles, pddBindPreCheck, pddFastBindMobile, pddSendBindSms, pddVerifyBindSms,
-  pddNewBindMobile, pddUnbindMobile, pddUpdateMobileAlias, pddStationPackages, applyPddPickupCodes,
+  pddNewBindMobile, pddUnbindMobile, pddUpdateMobileAlias, pddStationPackages, importPddStationPackages,
   type PddBindPreCheck, type PddBoundMobile,
 } from "../utils/pddExpress"
 import { pddAntiCleanup } from "../utils/pddAnti"
-import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
+import { type PddAuthMode } from "../utils/pddToken"
 
 export type PddMobiles = { pre: PddBindPreCheck | null; mobiles: PddBoundMobile[]; onlyWxScan?: boolean; waiting?: number }
 
@@ -55,8 +55,8 @@ export function PddMobileSection({ authed, bump }: {
 
   useEffect(() => {
     if (left <= 0) return
-    const { id: t, scheduled } = tryScheduleTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000); if (!scheduled) { /* 倒计时不可用则停在当前秒 */ }
-    return () => safeClearTimeout(t)
+    const t = setTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000)
+    return () => clearTimeout(t)
   }, [left])
 
   useEffect(() => {
@@ -86,8 +86,8 @@ export function PddMobileSection({ authed, bump }: {
     setBusy(true)
     try {
       await op()
-      // 绑定后，寄到这个号、绑定前就到站的件才查得到，顺手把取件码补进包裹
-      void applyPddPickupCodes().catch(() => { })
+      // 绑定后，寄到这个号、绑定前就到站的件才查得到，顺手导入/补码
+      void importPddStationPackages().catch(() => { })
       await reload()
       notify(done)
       bump()
@@ -276,5 +276,35 @@ export function PddMobileSection({ authed, bump }: {
         </NativeSection>
       ) : null}
     </>
+  )
+}
+
+/** 授权方式：网页登录 / Token。两者登录态存同一处，所以切换前必须把旧会话清干净。 */
+export function PddAuthSection({ mode, onSwitch }: {
+  mode: PddAuthMode; onSwitch: (m: PddAuthMode) => void
+}) {
+  const label = mode === "token" ? "Token登录" : "网页登录"
+  return (
+    <Section title="授权方式"
+      footer={mode === "token"
+        ? "Token 由对方提供，不打开登录页，不会把对方 App 挤下线。"
+        : "在 App 内用手机号登录拼多多，登录一次长期有效。"}>
+      <HStack spacing={12} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
+        <Icon name="key.horizontal" size={18} color={C.accent} />
+        <Text font={16} foregroundStyle={C.text}>登录方式</Text>
+        <VStack frame={{ maxWidth: "infinity" }} />
+        <Menu label={
+          <HStack spacing={3}>
+            <Text font={15} foregroundStyle={C.accent}>{label}</Text>
+            <Image systemName="chevron.up.chevron.down" font={11} foregroundStyle={C.tertiary} />
+          </HStack>
+        }>
+          <Button title="网页登录" systemImage={mode === "web" ? "checkmark" : undefined}
+            action={() => onSwitch("web")} />
+          <Button title="Token登录" systemImage={mode === "token" ? "checkmark" : undefined}
+            action={() => onSwitch("token")} />
+        </Menu>
+      </HStack>
+    </Section>
   )
 }

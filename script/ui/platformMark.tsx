@@ -11,6 +11,8 @@ const FILE: Record<string, string> = {
   taobao: "identity/taobao.png",
   jd: "identity/jd.png",
   pdd: "identity/pdd.jpg",
+  vip: "identity/vip.png",
+  dewu: "identity/dewu.png",
   fengchao: "logos64/hive.png",
 }
 

@@ -6,6 +6,7 @@ import { syncPlatformIcons } from "./utils/platformIcons"
 import { dedupeDeliveredReminders } from "./utils/reminders"
 import { consumeIntentInbox } from "./utils/intentInbox"
 import { presentRecognizeResult } from "./utils/clipboardRecognize"
+// 临时演示数据（看完删）
 
 /** 点通知进来时，包裹 uuid 在 Script.notificationInfo.userInfo 里（不是 queryParameters） */
 function notifUuid(): string | undefined {

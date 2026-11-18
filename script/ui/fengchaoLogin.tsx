@@ -1,12 +1,13 @@
 // 丰巢授权：原生表单（手机号 + 短信验证码），不走 WebView。
 // 丰巢的登录接口需要 RSA 签名，页面本身没有可复用的登录页，所以这里直接用接口登录，
 // 界面完全由我们绘制，不存在页面排版问题。token 存 Keychain，之后长期复用。
-import { Text, VStack, HStack, TextField, Button, Spacer, useState, useEffect } from "scripting"
+import { Text, VStack, HStack, TextField, Button, Spacer, Navigation, useState, useEffect } from "scripting"
 import { C } from "../theme"
 import { Section, SubPage } from "./kit"
 import { fcLogin, fcMobile, fcSendCode } from "../utils/fengchao"
 import { notify } from "./notify"
-import { tryScheduleTimeout, safeClearTimeout } from "../utils/safeTimer"
+import { markPlatform, setPlatformEnabled } from "../platforms"
+import { syncPlatformParcels } from "../utils/platformSync"
 
 export function FengchaoLoginPage({ close, bump, onDone }: { close: () => void; bump: () => void; onDone?: () => void }) {
   const [phone, setPhone] = useState(fcMobile())
@@ -17,8 +18,8 @@ export function FengchaoLoginPage({ close, bump, onDone }: { close: () => void; 
 
   useEffect(() => {
     if (left <= 0) return
-    const { id: t, scheduled } = tryScheduleTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000); if (!scheduled) { /* 倒计时不可用则停在当前秒 */ }
-    return () => safeClearTimeout(t)
+    const t = setTimeout(() => setLeft(v => (v > 0 ? v - 1 : 0)), 1000)
+    return () => clearTimeout(t)
   }, [left])
 
   const phoneOk = /^1\d{10}$/.test(phone.replace(/\D/g, ""))
@@ -96,4 +97,18 @@ export function FengchaoLoginPage({ close, bump, onDone }: { close: () => void; 
       ) : null}
     </SubPage>
   )
+}
+
+/**
+ * 作为三级页 push 进来时的外壳：登录成功后真的弹栈，并标记授权 + 只同步丰巢。
+ * （页面自己在成功时调 close()，不包这一层就会留在原地不动）
+ */
+export function FengchaoLoginPushed({ bump }: { bump: () => void }) {
+  const dismiss = Navigation.useDismiss()
+  return <FengchaoLoginPage bump={bump} close={() => { try { dismiss() } catch { } }}
+    onDone={() => {
+      markPlatform("fengchao", true)
+      setPlatformEnabled("fengchao", true)
+      void syncPlatformParcels(undefined, { only: ["fengchao"], force: true }).catch(() => { })
+    }} />
 }

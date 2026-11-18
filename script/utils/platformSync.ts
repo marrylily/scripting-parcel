@@ -5,40 +5,56 @@
  * 结果写进本脚本的 Pickup，source 标成对应平台，刷新时各走各的。
  */
 import type { Pkg } from "./model"
-import { classify, isHistoricalPkg, shouldDropPkg, stationHaystack, timeOfTrack } from "./model"
-import { Notification } from "scripting"
+import { classify, classifyAny, closedOrderStatus, isHistoricalPkg, shouldDropPkg, stationHaystack, timeOfTrack } from "./model"
+import { Notification, Script } from "scripting"
 import { hasLogin as taobaoHasLogin, syncAll as taobaoSyncAll, fetchPackage as taobaoFetch, taobaoHumanVerify } from "./net"
 import { jdHasLogin, jdSyncAll, jdFetchPackage, jdResetDevice } from "./jd"
-import { pddHasLogin, pddSyncAll, pddFetchPackage } from "./pdd"
-import { addPickup, arrivalState, getPickups, getSettings, matchStation, updatePickup, type Pickup } from "../store"
+import { pddHasLogin, pddSyncAll, pddFetchPackageFast } from "./pdd"
+import { vipFetchOrders, vipHasLogin } from "./vip"
+import { dewuFetchOrders, dewuHasLogin } from "./dewu"
+import { addPickup, arrivalState, getPickups, getSettings, isPickupRemoved, matchStation, updatePickup, type Pickup } from "../store"
 import { extractPickupCode } from "./pickupCode"
 import { mergeCodes, codeKey } from "./codes"
 import { etaInObject, etaInText, etaTimeInText } from "./eta"
 import { notifyArrived, forgetArrived, reschedulePickupReminders } from "./reminders"
 import { arrivedAtOf } from "./arrive"
-import { companyCode, companyName } from "../theme"
+import { companyCode, companyCodeInText, companyName } from "../theme"
 import { markPlatform, platformEnabled, type PlatformId } from "../platforms"
 import { fcHasLogin, fcPickToBox, fcWaitPick } from "./fengchao"
-import { miHasLogin, miFetchList, miFetchDetail, parseMiTraces, type MiExpressItem } from "./mi"
-import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, trackMailNo as cnTrackMailNo } from "./cainiao"
+import { fetchMyPackages as cnFetchMyPackages, cainiaoLoginOk, detectCompany as cnDetectCompany, trackMailNo as cnTrackMailNo } from "./cainiao"
 import { notify } from "../ui/notify"
 import { warningIconData } from "./notifyIcon"
-import { orderForManualSync, shouldStartHumanVerify, tagSyncError, platformDue, gapLabel, sanitizeSyncMessage, MANUAL_SYNC_MS } from "./syncSafety"
-import { acquireSyncRun, isSupersededError, releaseSyncRun, runIsCurrent } from "./syncGate"
-import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
-type Source = "taobao" | "jd" | "pdd" | "fengchao" | "mi" | "cainiao"
+type Source = "taobao" | "jd" | "pdd" | "vip" | "dewu" | "fengchao" | "cainiao"
+
+/* ---------------- 平台没给公司名时，自己问一次 ----------------
+ * 淘宝/菜鸟的列表经常不带快递公司（或者只给英文码），卡片的图标和名字就空了。
+ * 单号本身能识别：菜鸟 queryCpByMailNo 不需要额外授权，一轮最多问 COMPANY_BUDGET 次。 */
+const COMPANY_BUDGET = 12
+const companyTried = new Set<string>()
+async function withCompany(p: Pkg): Promise<Pkg> {
+  const known = companyCode(p.company || "") > 0
+  const no = String(p.mailNo || "").trim()
+  if (known || !no || companyTried.size >= COMPANY_BUDGET || companyTried.has(no)) return p
+  companyTried.add(no)
+  try {
+    const d = await cnDetectCompany(no)
+    const name = d?.cpName || d?.cpCode || ""
+    if (name && companyCode(name) > 0) return { ...p, company: name }
+  } catch { }
+  return p
+}
 
 /** 京东/拼多多靠隐藏 WebView 抓页面；扩展环境没有这个类时直接跳过，不白等超时 */
-export function platformCapability(): { taobao: boolean; jd: boolean; pdd: boolean } {
+export function platformCapability(): { taobao: boolean; jd: boolean; pdd: boolean; dewu: boolean } {
   let wv = false
   try { wv = typeof WebViewController === "function" } catch { wv = false }
   // 淘宝发现订单也靠 WebView（h5 olist）：以前这里写死 true，
   // 在没有 WebView 的扩展进程里会直接抛错，看起来就是“淘宝同步失败”。
-  return { taobao: wv, jd: wv, pdd: wv }
+  return { taobao: wv, jd: wv, pdd: wv, dewu: wv }
 }
 
-const delay = (ms: number) => safeDelay(ms)
+const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
 
 function nowText(): string {
   const d = new Date()
@@ -53,7 +69,7 @@ function pickupStatus(p: Pkg): 1 | 2 {
 
 function sourceName(s: Source): string {
   return s === "taobao" ? "淘宝" : s === "jd" ? "京东" : s === "fengchao" ? "丰巢"
-    : s === "mi" ? "小米快递" : s === "cainiao" ? "菜鸟" : "拼多多"
+    : s === "cainiao" ? "菜鸟" : s === "vip" ? "唯品会" : s === "dewu" ? "得物" : "拼多多"
 }
 
 /** 已有的同一条记录：先按平台订单号，再按运单号判断，避免重复加
@@ -74,8 +90,8 @@ function findExisting(list: Pickup[], s: Source, p: Pkg): Pickup | undefined {
  *  否则后同步的平台会把 source 抢走：菜鸟一跑，淘宝/京东的单全变成菜鸟，
  *  而菜鸟没有单条刷新能力，「已取件」时的最后拉一次物流就静默不做了。 */
 function nextSource(s: Source, current?: string): Source {
-  // 菜鸟、小米、丰巢都是「聚合多平台快递」的源，不能抢走电商单的归属
-  const agg = (v?: string) => v === "fengchao" || v === "cainiao" || v === "mi"
+  // 菜鸟、丰巢都是「聚合多平台快递」的源，不能抢走电商单的归属
+  const agg = (v?: string) => v === "fengchao" || v === "cainiao"
   if (agg(s)) return (current ?? s) as Source
   if (!current || agg(current)) return s
   return current as Source
@@ -93,10 +109,13 @@ function closedTextOf(text: string): string {
 
 /** 把一条平台包裹写进 Pickup（有就更新，没有就新建） */
 function upsert(s: Source, p: Pkg): boolean {
+  // 用户删过这单：不再导入、也不再唤醒它（删除记忆，只有清缓存才清）
+  if (isPickupRemoved({ mailNo: p.mailNo, orderId: p.orderId })) return false
   const list = getPickups()
   const exist = findExisting(list, s, p)
-  const idx = companyCode(p.company || "")
   const latestText = (p.latest || "").trim()
+  // 平台没给公司名时，物流文案开头往往就写着「【中通快递】…」：先就地认一次，不发请求
+  const idx = companyCode(p.company || "") || companyCodeInText(latestText)
   // 没有短信了，驿站归属与取件页归属都从物流文案里推
   const rawArrival = arrivalState(latestText)
   const arrival = rawArrival
@@ -252,10 +271,14 @@ function upsert(s: Source, p: Pkg): boolean {
     const signedAt = arrivedAtOf(nodeList) ?? p.lastTrackAt ?? 0
     if (signedAt > 0 && Date.now() - signedAt > 7 * 86400_000) return false
   }
+  // 最后一条节点已超过 14 天：不管归成在途还是签收，都是平台一直列着的老单，不再新导入。
+  // （已入库的记录不受影响，只是不再从零新建卡片）
+  const seenAt = p.lastTrackAt ?? 0
+  if (seenAt > 0 && Date.now() - seenAt > 14 * 86400_000) return false
   const newStatus: 1 | 2 = p.status === "delivered" && !codeText && !p.stationName && !station ? 2 : 1
   const created = addPickup({    code: codeText,
     codes: codeText ? [codeText] : [],
-    companyName: idx || 1,
+    companyName: idx,
     address: station?.name ?? p.stationName ?? "",
     phone: "",
     notes: latestText,
@@ -270,7 +293,7 @@ function upsert(s: Source, p: Pkg): boolean {
     courierStationUuid: station?.uuid ?? "",
     itemTitle: p.itemTitle || "",
     mailNo: p.mailNo || "",
-    trackCompany: p.company || companyName(idx || 1),
+    trackCompany: p.company || (idx > 0 ? companyName(idx) : ""),
     trackLatest: latestText,
     trackNodes: nodeList,
     trackUpdatedAt: Date.now(),
@@ -317,8 +340,6 @@ export interface PlatformSyncReport {
   ran?: string[]
   /** 按平台 id 索引的结论（新界面请只用这个） */
   results: Record<string, PlatformSyncResult>
-  /** 已有一轮同步持有页面。自动轮次直接退出，不记失败。 */
-  busy?: boolean
 }
 
 /** 点「已取件」时最后拉一次物流：把最终节点存下来，之后这个包裹不再更新。
@@ -341,18 +362,11 @@ export async function finalRefreshForPickup(uuid: string): Promise<void> {
       const fresh = await jdFetchPackage({ orderId: rawId, itemTitle: item.itemTitle || "", shopName: item.trackCompany || "", statusHint: item.trackLatest || "" } as any)
       if (fresh) { latest = fresh.latest || ""; tracks = fresh.tracks ?? null; company = fresh.company || "" }
     } else if (src === "pdd" && rawId) {
-      const fresh = await pddFetchPackage({ orderSn: rawId, itemTitle: item.itemTitle || "", shopName: "", statusHint: item.trackLatest || "" })
+      const fresh = await pddFetchPackageFast({ orderSn: rawId, itemTitle: item.itemTitle || "", shopName: "", statusHint: item.trackLatest || "" })
       if (fresh) { latest = fresh.latest || ""; tracks = fresh.tracks ?? null; company = fresh.company || "" }
     } else if (src === "cainiao" && item.mailNo) {
       const r = await cnTrackMailNo(String(item.mailNo))
       if (r) { latest = r.nodes[0]?.text || ""; tracks = r.nodes; company = r.company || "" }
-    } else if (src === "mi" && item.mailNo) {
-      const phones = miPhones()
-      if (phones.length > 0) {
-        const root = await miFetchDetail({ mailNo: String(item.mailNo), cpName: item.trackCompany || "" } as any, phones)
-        const t = parseMiTraces(root)
-        if (t.length > 0) { tracks = t; latest = t[0].text }
-      }
     }
     if (!latest && !(tracks && tracks.length > 0)) return
 
@@ -365,38 +379,33 @@ export async function finalRefreshForPickup(uuid: string): Promise<void> {
 }
 
 /** 平台显示名：以前这里只写了 taobao/jd/kdniao 三个分支，其余全落到「拼多多」，
- *  结果小米/丰巢/菜鸟失败时会弹出「拼多多同步失败」。必须是完整映射。*/
+ *  结果丰巢/菜鸟失败时会弹出「拼多多同步失败」。必须是完整映射。*/
 const PLAT_LABEL: Record<string, string> = {
   taobao: "淘宝", jd: "京东", pdd: "拼多多", cainiao: "菜鸟",
-  fengchao: "丰巢", mi: "小米快递", kdniao: "快递鸟",
+  vip: "唯品会", dewu: "得物", fengchao: "丰巢", kdniao: "快递鸟",
 }
 
 /** 鉴权类失败：这几类才算登录失效，其余一次页面没加载出来不能把授权标成失效 */
-const AUTH_RE = /未登录|请先登录|还没授权|登录已失效|登录态.{0,6}过期|登录态无效|重新授权|重新登录|FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED|401|403/
+/**
+ * 「登录失效」类文案。注意要包含「需要先登录 / 请重新授权」这种平台自有说法，
+ * 否则唯品会、得物返回的「需要先登录」会被当成普通失败，要连败 3 次才告诉你。
+ */
+const AUTH_RE = /未登录|需要.{0,4}登录|请先登录|还没授权|授权(?:失败|过期|失效)|登录已失效|登录态.{0,6}过期|登录态无效|重新授权|重新登录|FAIL_SYS_SESSION_EXPIRED|SESSION_EXPIRED/
 
 /**
  * 平台原始错误 → 一句人话。授权页、平台详情页、系统通知都调这一份，
  * 保证同一个故障在任何地方看到的字都一样（用户反馈过两处文案对不上）。
  */
-function sanitizeDetail(t: string): string {
-  return sanitizeSyncMessage(t, 80)
-}
-
 export function platformErrorText(raw: string): string {
   const t = String(raw ?? "").replace(/\s+/g, " ").trim()
   if (!t) return "同步失败"
   if (/未绑定取件手机号/.test(t)) return "未绑定取件手机号，请先绑定"
-  if (/需重新登录或完成验证/.test(t)) return sanitizeDetail(t)
   if (/人机验证|滑块|需要手动完成/.test(t)) return "需要人机验证，请手动完成"
   if (/限流|排队|大促|访问频繁/.test(t)) return "访问被限流，稍后自动恢复"
-  // 已带步骤名/耗时的超时不要再收成「网络超时，请稍后重试」
-  if (/淘宝·.+超时|超时 \d+\.\d+s/.test(t) || (/超时|timeout/i.test(t) && /https?:\/\/|\s[a-z0-9.-]+\//i.test(t))) {
-    return sanitizeDetail(t)
-  }
   if (/超时|timeout/i.test(t)) return "网络超时，请稍后重试"
   if (AUTH_RE.test(t)) return "登录已失效，请重新授权"
   // 接口返回码/网关异常原样保留，后台报障时能直接对上
-  return sanitizeDetail(t)
+  return t.slice(0, 44)
 }
 
 /** 记录一个平台的结论（成功/失败/跳过只有一个入口） */
@@ -408,23 +417,30 @@ async function handleError(id: PlatformId, e: any, report: PlatformSyncReport, a
   const raw = String(e?.message ?? e)
   const authLike = AUTH_RE.test(raw)
   const name = PLAT_LABEL[id] ?? "该平台"
-  const human = tagSyncError(platformErrorText(raw))
+  const human = platformErrorText(raw)
   setResult(report, id, "failed", human)
   // 失败原因写进共享日志；并记连续失败计数（同一平台连败 3 次 → 气泡+系统通知）
   let failStreak = 0
+  let authNotifyAt = 0
+  let authFresh = false
   try {
     const f = `${FileManager.appGroupDocumentsDirectory}/cc/syncErr.json`
     const prev = FileManager.existsSync(f) ? JSON.parse(FileManager.readAsStringSync(f) || "{}") : {}
     failStreak = Number(prev?.[id]?.streak ?? 0) + 1
+    authNotifyAt = Number(prev?.[id]?.authAt ?? 0)
     // msg 存归一后的人话（授权页直接展示），raw 留着排查用
-    prev[id] = { at: Date.now(), msg: human, raw: raw.slice(0, 200), streak: failStreak }
+    prev[id] = { at: Date.now(), msg: human, raw: raw.slice(0, 200), streak: failStreak, authAt: authNotifyAt }
+    // 鉴权失败：只在本平台首次失效时提示一次，3 小时内不重复（否则每轮全量都弹一遍）
+    authFresh = authLike && Date.now() - authNotifyAt > 3 * 3600_000
+    if (authFresh) prev[id].authAt = Date.now()
     FileManager.writeAsStringSync(f, JSON.stringify(prev))
   } catch { }
   if (authLike) {
     markPlatform(id, false, "登录已失效")
     report.errors.push(`${name}：${human}`)
-    if (allowToast) notify(`${name}登录已失效，请重新授权`, "warn")
-    if (allowSystemNotify && getSettings().syncFailNotify !== false) {
+    const fresh = authFresh
+    if (fresh && allowToast) notify(`${name}登录已失效，请重新授权`, "warn")
+    if (fresh && allowSystemNotify && getSettings().syncFailNotify !== false) {
       try {
         Notification.schedule({
           title: `⚠️ ${name}登录已失效`,
@@ -529,7 +545,10 @@ function clearFailStreak(id: PlatformId) {
 
 /** 给单条刷新加超时：网页卡住时不把整轮同步拖死（组件里 18 秒预算很紧） */
 function timeoutWrap<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  return safeTimeoutRace(p, ms, `${what}超时`)
+  return new Promise<T>((resolve, reject) => {
+    const t = (setTimeout as any)(() => reject(new Error(`${what}超时`)), ms)
+    p.then(v => { clearTimeout(t); resolve(v) }, e => { clearTimeout(t); reject(e) })
+  })
 }
 
 /** 刷新单条平台包裹；返回是否真的变了 */
@@ -583,27 +602,23 @@ async function refreshOne(item: any): Promise<boolean> {
       tracks: r.nodes.slice(0, 60),
     } as Pkg)
   }
-  if (s === "mi") {
-    const phones = miPhones()
-    if (!item.mailNo || phones.length === 0) return false
-    const root = await timeoutWrap(miFetchDetail({
-      mailNo: String(item.mailNo),
-      cpName: item.trackCompany || "",
-      logisticsUpdateTime: item.trackUpdatedAt ? new Date(item.trackUpdatedAt).toISOString() : undefined,
-    } as any, phones), 20000, "小米轨迹")
-    const tracks = parseMiTraces(root)
-    if (tracks.length === 0) return false
-    const latest = tracks[0].text
-    return upsert("mi", {
-      orderId: item.orderId ?? `mi:${item.mailNo}`,
+  if (s === "vip") {
+    // 唯品会没有公开的单件轨迹接口：有运单号就拿去菜鸟（免登录）查，没单号就跳过
+    if (!item.mailNo) return false
+    const r = await timeoutWrap(cnTrackMailNo(String(item.mailNo)), 20000, "唯品会轨迹")
+    if (!r || r.nodes.length === 0) return false
+    const latest = r.nodes[0]?.text || ""
+    if (!latest) return false
+    return upsert("vip", {
+      orderId: item.orderId ?? `vip:${item.mailNo}`,
       itemTitle: item.itemTitle || "",
       shopName: "",
-      company: item.trackCompany || "",
+      company: r.company || item.trackCompany || "",
       mailNo: String(item.mailNo),
       latest,
       status: classify(latest),
       updatedAt: Date.now(),
-      tracks,
+      tracks: r.nodes.slice(0, 60),
     } as Pkg)
   }
   if (s === "fengchao") {
@@ -650,13 +665,20 @@ async function refreshOne(item: any): Promise<boolean> {
   if (s !== "pdd") return false
   if (!pddHasLogin() || !item.orderId) return false
   const orderSn = String(item.orderId).replace(/^pdd:/, "")
-  const fresh = await timeoutWrap(pddFetchPackage({
+  const fresh = await timeoutWrap(pddFetchPackageFast({
     orderSn,
     itemTitle: item.itemTitle || "",
     shopName: "",
     statusHint: item.trackLatest || "",
   }), 25000, "拼多多物流页")
   return upsert("pdd", { ...fresh, orderId: `pdd:${orderSn}` } as Pkg)
+}
+
+/** 用户点进某条平台包裹时，只刷这一条（不发现新单，不开多个网页） */
+export async function refreshOnePickup(uuid: string): Promise<boolean> {
+  const item = getPickups().find(p => p.uuid === uuid)
+  if (!item || !item.source) return false
+  try { return await refreshOne(item as any) } catch { return false }
 }
 
 /** 每轮最多开多少个网页单（京东/拼多多每单一个 WebView，并发会被风控） */
@@ -674,9 +696,9 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
     if (p.source === "taobao") return cap.taobao
     if (p.source === "jd") return cap.jd
     if (p.source === "pdd") return cap.pdd
-    // 聚合源也能刷：菜鸟按运单号查轨迹、小米查详情、丰巢重拉在柜列表
+    // 聚合源也能刷：菜鸟按运单号查轨迹、丰巢重拉在柜列表
     if (p.source === "cainiao") return taobaoHasLogin()
-    if (p.source === "mi") return miHasLogin()
+    if (p.source === "vip") return !!p.mailNo
     if (p.source === "fengchao") return fcHasLogin()
     return false
   })
@@ -691,10 +713,11 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
 
   // 淘宝是纯 HTTP（快、可并发）；京东/拼多多每单开一个网页，串行 + 限额 + 间隔
   const tbList = targets.filter(t => t.source === "taobao")
-  // 菜鸟/小米/丰巢也是接口类，不开网页，但串行跑并留点间隔
-  const apiList = targets.filter(t => t.source === "cainiao" || t.source === "mi" || t.source === "fengchao")
+  // 菜鸟/丰巢也是接口类，不开网页，但串行跑并留点间隔
+  const apiList = targets.filter(t => t.source === "cainiao" || t.source === "fengchao" || t.source === "vip")
   const pageList = targets.filter(t => t.source === "jd" || t.source === "pdd").slice(0, PAGE_REFRESH_MAX)
 
+  // 淘宝是纯 HTTP（快、可并发）：与参考实现（快递聚合4.0 utils/sync.ts）一致，全并发
   const tbResults = await Promise.all(tbList.map(t => refreshOne(t).catch(() => false)))
   for (const ok of tbResults) if (ok) changed++
 
@@ -710,8 +733,8 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
     if (i < pageList.length - 1) await delay(PAGE_REFRESH_GAP)
   }
 
-  // 顺带用菜鸟 MTOP 批量核销一次已取件：驿站扫码出库后，菜鸟状态立即变为 SIGN（c.done=true），
-  // 即使原包裹归属在淘宝/拼多多/京东，下拉刷新或小组件刷新也能立刻把「待取」自动转成「已取」。
+  // 顺带用菜鸟 MTOP 批量核销一次已取件与新取件码：驿站扫码出库后，菜鸟状态立即变为 SIGN（c.done=true），
+  // 即使原包裹归属在淘宝/拼多多/京东，刷新时也能立刻把「待取」自动转成「已取」。
   if (taobaoHasLogin() && platformEnabled("cainiao")) {
     try {
       const pending = getPickups().filter(p => p.status === 1 && !p.pickedByUser && p.mailNo)
@@ -748,76 +771,73 @@ export async function refreshPlatformParcels(limit = 20): Promise<number> {
     } catch { }
   }
 
+  // 顺手补公司名：老数据里「不知道是哪家快递」的包裹，按单号问一次菜鸟（免额外授权）。
+  // 一轮最多 3 条，不抢物流刷新的预算。
+  companyTried.clear()
+  const unknown = getPickups()
+    .filter(p => !(Number(p.companyName) || 0) && !!p.mailNo && !p.pickedByUser)
+    .slice(0, 3)
+  for (const p of unknown) {
+    const filled = await withCompany({ ...p, company: "" } as any)
+    const nm = String((filled as any).company || "")
+    if (nm && companyCode(nm) > 0) {
+      updatePickup(p.uuid, { companyName: companyCode(nm), trackCompany: p.trackCompany || nm })
+      changed++
+    }
+  }
+
   return changed
 }
 
 /* ---------------- 手动/打开 App 时的全量同步：发现新订单 ---------------- */
 
 /** 全量同步三个平台（只跑已授权的），把结果并进包裹列表 */
-export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean; gapMs?: number; preempt?: boolean }): Promise<PlatformSyncReport> {
+export async function syncPlatformParcels(onProgress?: (text: string) => void, opts?: { silent?: boolean; deadline?: number; force?: boolean; only?: string[]; quietIssues?: boolean }): Promise<PlatformSyncReport> {
   const report: PlatformSyncReport = { added: 0, updated: 0, errors: [], skipped: [], ran: [], results: {} }
   const deadline = opts?.deadline ?? Number.POSITIVE_INFINITY
-  const lockUntil = Number.isFinite(deadline) ? deadline : Date.now() + MANUAL_SYNC_MS
-  // 手动同步取代正在跑的自动同步。自动同步碰到未过期的锁就退出，避免两轮页面互相改诊断。
-  const slot = acquireSyncRun(opts?.preempt ? "manual" : "auto", lockUntil)
-  if (!slot.ok) {
-    report.busy = true
-    return report
-  }
-  try {
   const timeUp = () => Date.now() > deadline
   const before = getPickups().length
-  const cap = platformCapability()
-  const gapMs = opts?.force ? 0 : (opts?.gapMs ?? fullGapMs())
+  // 每轮全量同步都有自己的「问公司名」预算
+  companyTried.clear()
 
   // 平台顺序每轮轮换 + 每个平台自己记「上次成功时间」。
   // 组件里预算只有 18 秒，固定顺序会让排在最后那个永远吃不到预算 —— 用户指出的这个是真 bug。
   // only：刚授权完某个平台时只同步它，不要把其它平台也重拉一遍
   const only = opts?.only?.length ? new Set(opts.only) : null
+  // 小组件扩展的预算比 App 小得多（实测京东 12 单要 ~24 秒），这里按环境收紧
+  const inWidget = Script.env === "widget"
   const ids: string[] = []
   // 未授权不是错误：界面已经有「未授权」状态，再往 errors 里塞一条会让用户以为同步失败
-  // 淘宝/京东/拼多多发现新单要 WebView：没能力时仍列入，循环里记跳过原因，避免小组件把「没跑」当成失败连败。
-  if (taobaoHasLogin() && platformEnabled("taobao") && (!only || only.has("taobao"))) ids.push("taobao")
-  if (jdHasLogin() && (!only || only.has("jd"))) ids.push("jd")
-  if (pddHasLogin() && (!only || only.has("pdd"))) ids.push("pdd")
+  if (taobaoHasLogin() && platformCapability().taobao && platformEnabled("taobao") && (!only || only.has("taobao"))) ids.push("taobao")
+  if (jdHasLogin() && platformCapability().jd && (!only || only.has("jd"))) ids.push("jd")
+  if (pddHasLogin() && platformCapability().pdd && (!only || only.has("pdd"))) ids.push("pdd")
   if (fcHasLogin() && (!only || only.has("fengchao"))) ids.push("fengchao")
-  if (miHasLogin() && (!only || only.has("mi"))) ids.push("mi")
   // 菜鸟共用淘宝登录态（mtop 直连，不开网页）；没开菜鸟开关就不跑
   if (taobaoHasLogin() && platformEnabled("cainiao") && (!only || only.has("cainiao"))) ids.push("cainiao")
+  if (vipHasLogin() && (!only || only.has("vip"))) ids.push("vip")
+  if (dewuHasLogin() && platformCapability().dewu && (!only || only.has("dewu"))) ids.push("dewu")
 
   const succeededAt = readPlatformLast()
-  // 手动全量让菜鸟先跑：它不依赖 WebView。自动/组件同步仍轮换。
-  const ordered = opts?.force ? orderForManualSync(ids) : rotateOrder(ids)
-  if (!runIsCurrent(slot.id)) return report
-  // 本轮即将同步的平台先清旧失败，再写本轮结果（带版本和时间）
-  if (opts?.force && ordered.length) {
-    clearPlatformLastError(ordered)
-    clearPlatformLastSkip(ordered)
-  }
-  for (const id of ordered) {
-    if (!runIsCurrent(slot.id)) return report
-    if (!opts?.force && !platformDue(succeededAt[id], gapMs)) {
-      const msg = `距上次成功不足 ${gapLabel(gapMs)}，已跳过`
-      skipPlatform(report, id, msg)
-      continue
-    }
-    const needWv = id === "taobao" || id === "jd" || id === "pdd"
-    if (needWv && !cap[id as "taobao" | "jd" | "pdd"]) {
-      const msg = "当前环境没有 WebView，请在 App 内同步"
-      skipPlatform(report, id, msg)
-      continue
-    }
+  for (const id of rotateOrder(ids)) {
+    // 3 小时内成功过就不重拉：App 和组件共用一个时间戳，谁跑过另一边就跳过
+    // force=true（用户点「立即同步」）时无视闸门，否则手动同步会被刚跑过的组件卡住。
+    if (!opts?.force && Date.now() - (Number(succeededAt[id]) || 0) < fullGapMs()) continue
+    // 唯品会走自己的网关，请求太勤会直接回“抢购的小伙伴太多了”限流页，
+    // 所以单独把它放宽到 30 分钟一次
+    if (!opts?.force && id === "vip" && Date.now() - (Number(succeededAt["vip"]) || 0) < 30 * 60_000) continue
     if (timeUp()) {
       const msg = "时间不够，已跳过"
       report.errors.push(`${PLAT_LABEL[id] ?? id}：${msg}`)
-      skipPlatform(report, id, msg)
+      report.skipped!.push(msg)
+      setResult(report, id, "skipped", msg)
       continue
     }
     // 京东排队页是设备级风控：反复开页会不断刷新冷却计时。撞上后 30 分钟内直接跳过，不再开 WebView
     if (id === "jd" && jdCooling()) {
       // 冷却中是我们主动避开风控，不是故障 —— 不写 errors，但要让界面说清楚
       onProgress?.("京东冷却中，稍后自动恢复…")
-      skipPlatform(report, id, "冷却中，稍后自动恢复")
+      report.skipped!.push("京东冷却中，稍后自动恢复")
+      setResult(report, id, "skipped", "冷却中，稍后自动恢复")
       continue
     }
     try {
@@ -835,33 +855,30 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
         )
         const snap = await (async () => {
           try {
-            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb, slot.id)
+            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb)
           } catch (first: any) {
-            if (isSupersededError(first) || !runIsCurrent(slot.id)) throw first
             // 只有真滑块/安全验证才弹页给人；其他错误不打扰
             const needHuman = /人机验证/.test(String(first?.message ?? first))
             if (!needHuman || opts?.silent) throw first
-            // 预算不够就不要打开最长 3 分钟的验证页，避免挡住后续平台；验证要求仍返回给界面。
-            if (!shouldStartHumanVerify(deadline)) throw first
             onProgress?.("淘宝需要验证…")
-            const ok2 = await taobaoHumanVerify(deadline, slot.id)
+            const ok2 = await taobaoHumanVerify()
             if (!ok2) throw first
-            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb, slot.id)
+            return await taobaoSyncAll((done: number, total: number) => onProgress?.(`淘宝物流 ${done}/${total}…`), deadline, skipTb)
           }
         })()
         for (const p of snap.packages) {
           const item = { ...p, source: "taobao" as const, orderId: `tb:${p.orderId}` }
-          if (upsert("taobao", item)) report.updated++
+          if (upsert("taobao", await withCompany(item))) report.updated++
         }
         markPlatform("taobao", true)
       } else if (id === "jd") {
         onProgress?.("正在读取京东订单…")
         // 不再用「一个京东包裹都没有就拉历史」和 7 天窗口这类猜测：
         // 京东页面自己会报待收货计数，jdSyncAll 拿到 0 就直接判空态成功，一次列表页都不开。
-        const list = await jdSyncAll((done: number, total: number) => onProgress?.(`京东物流 ${done}/${total}…`), { wantHistory: false, deadline })
+        const list = await jdSyncAll((done: number, total: number) => onProgress?.(`京东物流 ${done}/${total}…`), { wantHistory: false, deadline, maxTargets: inWidget ? 3 : undefined })
         for (const p of list) {
           const pid = p.orderId.startsWith("jd:") ? p.orderId : `jd:${p.orderId}`
-          if (upsert("jd", { ...p, orderId: pid })) report.updated++
+          if (upsert("jd", await withCompany({ ...p, orderId: pid }))) report.updated++
         }
         markPlatform("jd", true)
         clearJdCooling()
@@ -944,50 +961,49 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
             pickupCode: c.pickupCode || undefined,
             eta: c.eta || undefined,
           }
-          if (upsert("cainiao", pkg)) report.updated++
+          if (upsert("cainiao", await withCompany(pkg))) report.updated++
         }
         markPlatform("cainiao", true)
-      } else if (id === "mi") {
-        onProgress?.("正在读取小米快递…")
-        // 手机号存共享目录：登录页写、同步读；没有绑定号就没法查列表
-        const phones = miPhones()
-        if (phones.length === 0) throw new Error("未绑定取件手机号，在平台详情页里绑定")
-        const list = await miFetchList(phones)
-        // 只做近 20 天的单（列表里带 logisticsUpdateTime，没有时间的保留，不能误杀新单）
-        const miCutoff = Date.now() - 20 * 86_400_000
-        const miRecent = list.filter((it) => {
-          const raw = String(it.logisticsUpdateTime ?? "").trim()
-          if (!raw) return true
-          const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(raw)
-          if (!m) return true
-          const t = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime()
-          return t >= miCutoff
-        })
-        // 列表接口不带轨迹：给未签收的单补详情。不按条数限额（那样会“先到先得”，
-        // 新单可能一条都没轮到），改按时间维度：只给 3 天内物流有更新的单补，
-        // 老单状态不会再变，不花请求。另外留一个 30 条的硬上限防极端情况拖死同步。
-        const miDetailFresh = 3 * 86_400_000
-        let detailBudget = 30
-        for (const it of miRecent) {
-          let tracks: { time: string; text: string }[] = []
-          const pending = !/已签收|已取|已妥投|已退回/.test(String(it.stateDesc ?? ""))
-          const raw2 = String(it.logisticsUpdateTime ?? "").trim()
-          const mm = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(raw2)
-          const updAt = mm
-            ? new Date(Number(mm[1]), Number(mm[2]) - 1, Number(mm[3]), Number(mm[4]), Number(mm[5])).getTime()
-            : Date.now()
-          const fresh = !raw2 || Date.now() - updAt <= miDetailFresh
-          if (pending && fresh && detailBudget > 0 && it.mailNo) {
-            detailBudget--
-            try { tracks = parseMiTraces(await miFetchDetail(it, phones)) } catch { }
-            if (detailBudget > 0) await delay(200)
+      } else if (id === "vip") {
+        onProgress?.("正在读取唯品会订单…")
+        const orders = await vipFetchOrders()
+        // 只取近 30 天（订单列表按时间倒序，太久的不入库）
+        const cutoff = Date.now() - 30 * 86_400_000
+        for (const o of orders) {
+          if (o.orderTime && o.orderTime < cutoff) continue
+          const pkg: Pkg = {
+            orderId: `vip:${o.orderSn || o.mailNo}`,
+            itemTitle: o.itemTitle || "唯品会订单",
+            shopName: "",
+            company: o.company,
+            mailNo: o.mailNo,
+            latest: o.statusHint || "唯品会订单",
+            status: closedOrderStatus(o.statusHint) ?? classifyAny(o.statusHint),
+            updatedAt: Date.now(),
           }
-          const pkg = miItemToPkg(it, tracks)
-          if (!pkg) continue
-          // mailNo 命中已有平台单时只合并取件码/驿站，不新增卡片
-          if (upsert("mi", pkg)) report.updated++
+          // 和拼多多一致：有运单号才新建，没运单号只更新已有卡片（upsert 自己拦）
+          if (upsert("vip", await withCompany(pkg))) report.updated++
         }
-        markPlatform("mi", true)
+        markPlatform("vip", true)
+      } else if (id === "dewu") {
+        onProgress?.("正在读取得物订单…")
+        const orders = await dewuFetchOrders()
+        const cutoff = Date.now() - 60 * 86_400_000
+        for (const o of orders) {
+          if (o.orderTime && o.orderTime < cutoff) continue
+          const pkg: Pkg = {
+            orderId: `dewu:${o.orderSn || o.mailNo}`,
+            itemTitle: o.itemTitle || "得物订单",
+            shopName: "",
+            company: o.company,
+            mailNo: o.mailNo,
+            latest: o.statusHint || "得物订单",
+            status: closedOrderStatus(o.statusHint) ?? classifyAny(o.statusHint),
+            updatedAt: Date.now(),
+          }
+          if (upsert("dewu", await withCompany(pkg))) report.updated++
+        }
+        markPlatform("dewu", true)
       } else {
         onProgress?.("正在读取拼多多订单…")
         let list: Pkg[] = []
@@ -1006,16 +1022,14 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
         }
         for (const p of list) {
           const pid = p.orderId.startsWith("pdd:") ? p.orderId : `pdd:${p.orderId}`
-          if (upsert("pdd", { ...p, orderId: pid })) report.updated++
+          if (upsert("pdd", await withCompany({ ...p, orderId: pid }))) report.updated++
         }
         markPlatform("pdd", true)
       }
       markPlatformLast(id)
       clearFailStreak(id as PlatformId)
-      clearPlatformLastSkip(id)
       setResult(report, id, "ok", "")
     } catch (e) {
-      if (isSupersededError(e) || !runIsCurrent(slot.id)) return report
       // 京东排队/限流：标记 30 分钟冷却，后续同步（含组件后台）不再撞墙
       if (id === "jd" && /限流|排队|大促/.test(String((e as any)?.message ?? e))) {
         markJdCooling()
@@ -1058,9 +1072,6 @@ export async function syncPlatformParcels(onProgress?: (text: string) => void, o
   }
   await delay(0)
   return report
-  } finally {
-    releaseSyncRun(slot.id)
-  }
 }
 
 /* ---------------- 定时全量：App 与小组件共用 ---------------- */
@@ -1069,67 +1080,6 @@ const FULL_KEY = "cc.platform.lastFullSync"
 /** 全量发现新订单的间隔（小时），跟设置走（默认 3 小时） */
 function fullGapMs(): number {
   return Math.max(1, Number(getSettings().fullSyncHours) || 3) * 3_600_000
-}
-
-/* ---------------- 小米快递辅助 ---------------- */
-
-const MI_PHONES_KEY = "cc.mi.phones"
-
-export function miPhones(): string[] {
-  const parse = (raw: any): string[] => {
-    try {
-      const v = raw ? JSON.parse(String(raw)) : []
-      return Array.isArray(v) ? v.map(String).filter(x => /^1\d{10}$/.test(x)) : []
-    } catch { return [] }
-  }
-  // 共享域优先：App 里绑的号，小组件进程也要能读到（否则组件同步会误报「未绑定手机号」）
-  try {
-    const shared = parse(Storage.get<string>(MI_PHONES_KEY, { shared: true }))
-    if (shared.length > 0) return shared
-  } catch { }
-  try { return parse(Storage.get<string>(MI_PHONES_KEY)) } catch { return [] }
-}
-
-export function miSetPhones(phones: string[]) {
-  const raw = JSON.stringify(phones)
-  // 两个域都写：App 自己读私有域，小组件/后台读共享域
-  try { Storage.set(MI_PHONES_KEY, raw, { shared: true }) } catch { }
-  try { Storage.set(MI_PHONES_KEY, raw) } catch { }
-}
-
-/** 小米列表项 → Pkg（字段名以 ExpressAssistant 解析为准，服务端字段名未验证） */
-function miItemToPkg(it: MiExpressItem, tracks: { time: string; text: string }[] = []): Pkg | null {
-  const mailNo = String(it.mailNo || "").trim()
-  if (!mailNo) return null
-  const latest = String(it.stateDesc || it.latest || "").trim()
-  if (!latest) return null
-  // 小米给的是纯物流文案，状态统一走 classify（含已退款/退单）；
-  // stateNum 107 = 已签收（对照 ExpressAssistant 的 XiaomiDetail 映射），其余按文案分类
-  const stateNum = Number(it.stateNum ?? 0)
-  const cls = classify(latest)
-  // 退款/取消优先于签收码：107 只说明“已签收”，不能盖掉“退款成功”这类终态
-  const status: Pkg["status"] = cls === "cancelled" ? "cancelled" : stateNum === 107 ? "delivered" : cls
-  return {
-    orderId: `mi:${mailNo}`,
-    itemTitle: String(it.productName || it.name || it.cpName || "小米快递"),
-    shopName: "",
-    company: String(it.cpName || it.provider || ""),
-    mailNo,
-    latest,
-    status,
-    tracks: tracks.length > 0 ? tracks : undefined,
-    lastTrackAt: timeOfTrack(tracks[0]?.time || "") || undefined,
-    updatedAt: Date.now(),
-    stationName: String(it.stationName || it.address || "").trim() || undefined,
-    // 城市：从地址里抠（地图要“当前位置→收货地”），抠不到就不填
-    city: (() => {
-      const m = /([\u4e00-\u9fa5]{2,8}(?:市|自治州|地区))/.exec(String(it.address ?? ""))
-      return m ? m[1] : undefined
-    })(),
-    pickupCode: String(it.pickupCode || "").trim() || undefined,
-    // 小米列表项可能带「预计…送达」（字段名各版本不一致，浅层扫）
-    eta: etaInObject(it) || undefined,
-  } as any
 }
 
 /* ---- 每平台「上次成功」与轮换指针，都放共享目录，跨进程一致 ---- */
@@ -1154,7 +1104,7 @@ function writeJsonFile(path: string, value: any): void {
 function readPlatformLast(): Record<string, number> {
   const v = readJsonFile(PLAT_LAST_FILE())
   const out: Record<string, number> = {}
-  // 以前这里只白名单了 taobao/jd/pdd，导致丰巢/菜鸟/小米的时间
+  // 以前这里只白名单了 taobao/jd/pdd，导致丰巢/菜鸟的时间
   // 永远读成 0 —— 平台详情页一直显示「从未同步」，点同步也会被判成“没变”。
   for (const k of Object.keys(v || {})) out[k] = Number((v as any)[k]) || 0
   return out
@@ -1176,81 +1126,8 @@ export function platformLastError(id: string): { at: number; msg: string } | nul
   const v = readJsonFile(`${FileManager.appGroupDocumentsDirectory}/cc/syncErr.json`)
   const e = v?.[id]
   if (!e) return null
-  // 已带版本戳的文案不再二次归一，避免把版本号切掉
-  const rawMsg = String(e.msg ?? e.raw ?? "")
-  const msg = /^\d+\.\d+\.\d+/.test(rawMsg) ? rawMsg : platformErrorText(rawMsg)
-  return { at: Number(e.at) || 0, msg }
-}
-
-/** 同步开始时清掉指定平台的旧失败记录，避免把上一版的错误继续展示在新脚本上。
- *  这些记录写在 App Group 的 cc/syncErr.json，同一 App 里多个「包裹助手」副本可能共用。 */
-export function clearPlatformLastError(ids: string | string[]): void {
-  const list = Array.isArray(ids) ? ids : [ids]
-  try {
-    const f = `${FileManager.appGroupDocumentsDirectory}/cc/syncErr.json`
-    if (!FileManager.existsSync(f)) return
-    const prev = JSON.parse(FileManager.readAsStringSync(f) || "{}") || {}
-    let changed = false
-    for (const id of list) {
-      if (prev[id]) { delete prev[id]; changed = true }
-    }
-    if (changed) FileManager.writeAsStringSync(f, JSON.stringify(prev))
-  } catch { }
-}
-
-const SKIP_FILE = () => `${FileManager.appGroupDocumentsDirectory}/cc/syncSkip.json`
-
-function readSkipMap(): Record<string, { at: number; msg: string }> {
-  const v = readJsonFile(SKIP_FILE())
-  return (v && typeof v === "object") ? v : {}
-}
-
-/** 把跳过原因写到 App Group，设置页能看到（带版本和时间）。不覆盖成功时间。 */
-export function recordPlatformSkip(id: string, reason: string): void {
-  try {
-    const prev = readSkipMap()
-    const at = Date.now()
-    prev[id] = { at, msg: tagSyncError(reason, at) }
-    writeJsonFile(SKIP_FILE(), prev)
-  } catch { }
-}
-
-export function clearPlatformLastSkip(ids: string | string[]): void {
-  const list = Array.isArray(ids) ? ids : [ids]
-  try {
-    const prev = readSkipMap()
-    let changed = false
-    for (const id of list) {
-      if (prev[id]) { delete prev[id]; changed = true }
-    }
-    if (changed) writeJsonFile(SKIP_FILE(), prev)
-  } catch { }
-}
-
-export function platformLastSkip(id: string): { at: number; msg: string } | null {
-  const e = readSkipMap()[id]
-  if (!e) return null
-  return { at: Number(e.at) || 0, msg: String(e.msg ?? "") }
-}
-
-/** 设置页展示：优先最近 3 小时内的失败，其次跳过原因。 */
-export function platformSyncHint(id: string): { kind: "error" | "skip"; at: number; msg: string } | null {
-  const err = platformLastError(id)
-  const skip = platformLastSkip(id)
-  const last = platformLastSyncedAt(id)
-  const fresh = (at: number) => Date.now() - at < 3 * 3_600_000
-  const errOk = err && fresh(err.at) && err.at >= last
-  const skipOk = skip && fresh(skip.at) && skip.at >= last
-  if (errOk && skipOk) return err!.at >= skip!.at ? { kind: "error", at: err!.at, msg: err!.msg } : { kind: "skip", at: skip!.at, msg: skip!.msg }
-  if (errOk) return { kind: "error", at: err!.at, msg: err!.msg }
-  if (skipOk) return { kind: "skip", at: skip!.at, msg: skip!.msg }
-  return null
-}
-
-function skipPlatform(report: PlatformSyncReport, id: string, msg: string): void {
-  recordPlatformSkip(id, msg)
-  report.skipped!.push(msg)
-  setResult(report, id, "skipped", tagSyncError(msg))
+  // 旧数据里 msg 存的是原始报错，读的时候也过一遍归一（对已归一的文案是幂等的）
+  return { at: Number(e.at) || 0, msg: platformErrorText(String(e.msg ?? e.raw ?? "")) }
 }
 
 /** 轮换：每轮把指针往后挪一格，预算总是不够时也不会把同一平台饿死 */
@@ -1290,37 +1167,36 @@ export function markFullSyncAt(at = Date.now()): void {
 /** 每 3 小时跑一次全量（发现新订单）。App 与小组件共用一个时间戳，谁先跑过另一边就跳过。
  * budgetMs：到点就停，剩下的下次再补（小组件渲染有硬超时）。
  */
-/** 打开 App / 下拉刷新时的每平台全量间隔：跟着前台刷新设置，至少 15 分钟，不再用 3 小时总闸。 */
-export function foregroundFullGapMs(): number {
-  const appMin = Math.max(5, Number(getSettings().refreshAppMin) || 20)
-  return Math.max(15, appMin) * 60_000
-}
+export async function maybeFullSync(budgetMs = 60_000): Promise<number> {
+  const cap = platformCapability()
+  // 只授权了丰巢的用户以前永远进不来（只判断了淘宝/京东/拼多多），
+  // 结果“每 3 小时自动同步”对他们完全失效。
+  const anyLogin = taobaoHasLogin() || (cap.jd && jdHasLogin()) || (cap.pdd && pddHasLogin())
+    || fcHasLogin()
+  if (!anyLogin) return 0
 
-export type MaybeFullSyncResult = { added: number; attempted: boolean; ok: string[] }
-
-/** 每平台到期才发现新订单。不再用「任意平台刚跑过」的全局 3 小时闸门挡住淘宝：
- *  小组件常先跑通菜鸟/小米/丰巢并写入 fullSync 时间戳，原先会让 App 打开时整轮直接 return。
- *  是否与另一轮重叠，由 syncPlatformParcels 的整轮锁决定，并在结束时释放。
- */
-export async function maybeFullSync(budgetMs = 60_000, opts?: { gapMs?: number; force?: boolean }): Promise<MaybeFullSyncResult> {
-  const empty: MaybeFullSyncResult = { added: 0, attempted: false, ok: [] }
-  const anyLogin = taobaoHasLogin() || jdHasLogin() || pddHasLogin() || fcHasLogin() || miHasLogin()
-  if (!anyLogin) return empty
+  const last = readFullSyncAt()
+  if (Date.now() - last < fullGapMs()) return 0
+  // 先占位，避免两个进程同时拉同一批
+  markFullSyncAt()
+  // 全量同步耗时最长（要过一遍所有已授权平台），先弹一条气泡告诉用户在干什么；
+  // 轻量刷新不弹（每几分钟一次，会吵）
+  notify("正在同步：发现新订单…", "info")
 
   const before = getPickups().length
   let report: PlatformSyncReport | null = null
   try {
-    report = await syncPlatformParcels(undefined, {
-      silent: true,
-      deadline: Date.now() + budgetMs,
-      gapMs: opts?.force ? 0 : (opts?.gapMs ?? fullGapMs()),
-      force: opts?.force,
-    })
+    report = await syncPlatformParcels(undefined, { silent: true, deadline: Date.now() + budgetMs })
   } catch { }
-  const ok = Object.entries(report?.results ?? {})
-    .filter(([, r]) => (r as any)?.outcome === "ok")
-    .map(([id]) => id)
-  if (ok.length) markFullSyncAt()
-  const attempted = (report?.ran?.length ?? 0) > 0 || Object.keys(report?.results ?? {}).length > 0
-  return { added: Math.max(0, getPickups().length - before), attempted, ok }
+  // 本轮平台一个也没成功：把“刚同步过”的时间戳退回去，冷却后就能重试，
+  // 否则会白等一个 fullSyncHours 周期（P2-6）。
+  try {
+    const ran = report?.ran?.length ?? 0
+    const okAny = Object.values(report?.results ?? {}).some((r: any) => r?.outcome === "ok")
+    if (ran > 0 && !okAny) {
+      const cool = Math.max(5, Number(getSettings().failCoolMin) || 30) * 60_000
+      markFullSyncAt(Date.now() - fullGapMs() + cool)
+    }
+  } catch { }
+  return Math.max(0, getPickups().length - before)
 }

@@ -12,16 +12,15 @@
 // 实测（2026-11-14）：用 fetch 请求这两个接口，Set-Cookie 可以直接从响应头读出来，
 // 所以整条链路不需要 WebView，也就不受“登录页里 JS 注入失效”的影响。
 import { COOKIE_KEY } from "./model"
-import { safeDelay, safeTimeoutRace } from "./safeTimer"
 
 const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 const GEN = "https://login.taobao.com/havanaone/loginLegacy/qrCode/generate.do?bizEntrance=taobao_h5&bizName=taobao"
 const QRY = "https://login.taobao.com/havanaone/loginLegacy/qrCode/query.do?bizEntrance=taobao_h5&bizName=taobao"
 const REFERER = "https://login.taobao.com/member/login.jhtml"
 
-const delay = (ms: number) => safeDelay(ms)
+const delay = (ms: number) => new Promise<void>(r => (setTimeout as any)(r, ms))
 function cap<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return safeTimeoutRace(p, ms, "请求超时").catch(() => fallback)
+  return Promise.race([p, delay(ms).then(() => fallback) as any])
 }
 
 export type QrCookie = { name: string; value: string; domain: string; path: string }

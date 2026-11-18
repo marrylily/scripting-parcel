@@ -76,6 +76,8 @@ const TAIL_PATTERNS: RegExp[] = [
 const STATION_PATTERNS: [RegExp, number][] = [
   [/[到至]\s*([^\s，,。；;、]{3,30}?)\s*(?:取|领取|自取)/, 6],
   [/(?:存放至|放至|放置于|已放[到入]|已到达|已送达|已存入)\s*([^\s，,。；;]{2,30})/, 5],
+  // 「取件点：幸福小区东门菜鸟驿站」是丰巢/兔喜类短信常见写法（取自 pickup-code-launcher 的样例）
+  [/(?:取件点|取件处|取件地址|自提点)[:：]\s*([^\s，,。；;]{2,30})/, 5],
   [/(?:位置|地址|网点)[:：]\s*([^\s，,。；;]{2,40})/, 4],
   [/([\u4e00-\u9fa5A-Za-z0-9]{2,20}(?:驿站|快递柜|自提点|快递超市|便利店|服务站|代收点|兔喜|丰巢))/, 2],
 ]
@@ -225,6 +227,19 @@ export function parseDeliveryText(input: string): ParsedPackage {
   if (st && !(out.code && st.includes(out.code))) {
     out.station = st
     hits.push(`驿站 ${st}`)
+  }
+
+  // 7) 兜底：整条文本就是一串取件码（剪贴板只复制了码、没有任何上下文）
+  //    只在既没认到码也没认到单号时生效，避免把运单号/手机号当成码
+  if (!out.code && !out.mailNo) {
+    const t = text.trim()
+    if (/^[0-9A-Za-z]{2,6}(?:-[0-9A-Za-z]{1,8}){0,3}$/.test(t) && t.length >= 4 && t.length <= 24) {
+      const bare = normalizeCode(t)
+      if (!isNoise(bare)) {
+        out.code = bare
+        hits.push(`取件码 ${bare}（裸码）`)
+      }
+    }
   }
 
   return out

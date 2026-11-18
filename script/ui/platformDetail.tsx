@@ -1,24 +1,23 @@
 // 平台详情页：从「账号授权」里点某个平台的图标/名字进来。
 // 这里放这个平台专属的东西：授权状态、专属设置（拼多多取件手机号、丰巢手机号…）、
 // 同步记录、解除授权。授权页本身只保留一行摘要，避免把所有设置堆在一页。
-import { Button, HStack, Image, Text, Toggle, VStack, useState } from "scripting"
+import { Button, HStack, Image, Navigation, NavigationStack, Text, Toggle, VStack, useState } from "scripting"
 import { C, RR } from "../theme"
 import { Icon, Section, SubPage } from "./kit"
 import { assetImage } from "./assets"
 import { notify } from "./notify"
 import {
-  PLATFORMS, authorize, clearAuth, hasAuth, markPlatform, needsReauth,
+  PLATFORMS, authNeedsPage, authorize, clearAuth, hasAuth, markPlatform, needsReauth,
   platformEnabled, platformState, setPlatformEnabled, type PlatformId,
 } from "../platforms"
-import { miPhones, platformLastSyncedAt, syncPlatformParcels, clearPlatformLastError, platformSyncHint } from "../utils/platformSync"
-import { sanitizeSyncMessage, MANUAL_SYNC_MS } from "../utils/syncSafety"
-import { readTaobaoDiag } from "../utils/taobaoTrace"
-import { PddMobileSection } from "./pddMobiles"
-import { MiPhoneSection } from "./miPhones"
+import { platformLastError, platformLastSyncedAt, syncPlatformParcels } from "../utils/platformSync"
+import { PddAuthSection, PddMobileSection } from "./pddMobiles"
+import { FengchaoLoginPushed } from "./fengchaoLogin"
+import { WebLoginPushed, type WebLoginId } from "./webLogin"
 import { fcMobile } from "../utils/fengchao"
-
-/** 详情页上新的一次同步取代上一次，旧调用不能把「同步中」清掉。 */
-let detailSyncEpoch = 0
+import { pddAuthMode, setPddAuthMode, type PddAuthMode } from "../utils/pddToken"
+import { pddAuthorize } from "../utils/pddAuth"
+import { readTaobaoDiag } from "../utils/taobaoTrace"
 
 function hmText(t: number): string {
   const d = new Date(t)
@@ -36,51 +35,80 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
   const p = PLATFORMS.find(x => x.id === id)
   const [rev, setRev] = useState(0)
   const [busy, setBusy] = useState(false)
+  // 拼多多专属：授权方式（网页登录 / Token），存在本地，下次进来还是这个
+  const [authMode, setAuthMode] = useState<PddAuthMode>(() => pddAuthMode())
   const [mobBusy, setMobBusy] = useState(false)
   const [syncText, setSyncText] = useState("")
+  // 登录页用全屏模态打开：关闭就回到当前这一页（不会动页面栈）
+  async function presentLoginPage(pid: PlatformId) {
+    try {
+      await Navigation.present({
+        modalPresentationStyle: "fullScreen",
+        element: (
+          <NavigationStack>
+            {pid === "fengchao"
+              ? <FengchaoLoginPushed bump={bump} />
+              : <WebLoginPushed key={pid} id={pid as WebLoginId | "cainiao"} bump={bump} />}
+          </NavigationStack>
+        ),
+      } as any)
+    } catch { }
+    setRev(r => r + 1)
+  }
 
   const authed = hasAuth(id)
   const expired = needsReauth(id)
   const st = platformState(id)
   const lastAt = platformLastSyncedAt(id)
-  const hint = platformSyncHint(id)
+  const err = platformLastError(id)
   const name = p?.name ?? id
 
   /* ---- 各平台专属设置都是内嵌 Section 组件，避免多开一层页面 ---- */
 
   async function doSync() {
-    const epoch = ++detailSyncEpoch
+    if (busy) return
     setBusy(true)
     setSyncText("准备中…")
     try {
-      clearPlatformLastError(id)
-      if (epoch === detailSyncEpoch) setRev(r => r + 1)
       // 只认平台结论（与授权页、通知同一份），不再拿平台名字去 errors 里模糊匹配：
-      // 「小米快递聚合」与「小米快递」对不上，就会把真实原因吐成「同步未完成」。
-      const report = await syncPlatformParcels((t) => {
-        if (epoch === detailSyncEpoch) setSyncText(t || "同步中…")
-      }, { force: true, preempt: true, quietIssues: true, deadline: Date.now() + MANUAL_SYNC_MS, only: [id] })
-      if (epoch !== detailSyncEpoch) return
+      // 平台名与 PLAT_LABEL 必须一个字不差，否则会把真实原因吐成「同步未完成」。
+      const report = await syncPlatformParcels((t) => setSyncText(t || "同步中…"),
+        { force: true, quietIssues: true, deadline: Date.now() + 90_000, only: [id] })
       const res = report?.results?.[id]
       if (res?.outcome === "ok") notify(`${name}已同步`)
-      else if (!res && !report?.busy) notify(`${name}未启用，请先授权或打开开关`, "warn")
-      else if (res) notify(sanitizeSyncMessage(String(res.message || "未完成"), 80), res.outcome === "failed" ? "warn" : "info")
+      else if (!res) notify(`${name}未启用，请先授权或打开开关`, "warn")
+      else notify(res.message, res.outcome === "failed" ? "warn" : "info")
     } catch (e: any) {
-      if (epoch !== detailSyncEpoch) return
-      notify(sanitizeSyncMessage(String(e?.message ?? e), 80) || "同步失败", "error")
+      notify(String(e?.message ?? e).slice(0, 30), "error")
     } finally {
-      if (epoch === detailSyncEpoch) {
-        setBusy(false)
-        setSyncText("")
-        setRev(r => r + 1)
-      }
+      setBusy(false)
+      setSyncText("")
+      setRev(r => r + 1)
     }
   }
 
   async function doAuth() {
     if (busy) return
-    // 丰巢是原生表单页，直接跳过去
-    if (id === "fengchao") { open("fengchaoLogin"); return }
+    // 需要登录页的平台：全屏模态打开（关闭回到本页，不碰页面栈）
+    if (authNeedsPage(id) && !(id === "pdd" && pddAuthMode() === "token")) {
+      await presentLoginPage(id)
+      return
+    }
+    // 拼多多：按授权方式分发（网页 / Token 弹窗），与账号授权列表共用一个入口
+    if (id === "pdd") {
+      setBusy(true)
+      try {
+        const r = await pddAuthorize()
+        if (r.ok) { markPlatform("pdd", true); notify("拼多多授权成功"); bump() }
+        else if (!r.canceled) notify(r.message, "warn")
+      } catch (e: any) {
+        notify(String(e?.message ?? e), "error")
+      } finally {
+        setBusy(false)
+        setRev(v => v + 1)
+      }
+      return
+    }
     setBusy(true)
     try {
       const e = await authorize(id)
@@ -98,6 +126,25 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
     }
   }
 
+  /** 换授权方式：两套会话存在同一个钥匙串槽，不清就会把旧身份当成新方式的登录态 */
+  async function switchPddMode(next: PddAuthMode) {
+    if (next === authMode) return
+    if (authed) {
+      const ok = await Dialog.confirm({
+        title: "切换授权方式",
+        message: "会清除当前保存的登录状态，需要用新方式重新授权。",
+        confirmLabel: "切换", cancelLabel: "取消",
+      })
+      if (!ok) return
+      clearAuth("pdd")
+      notify("已清除原有授权")
+    }
+    setPddAuthMode(next)
+    setAuthMode(next)
+    bump()
+    setRev(r => r + 1)
+  }
+
   return (
     <SubPage title={name} onClose={close} closeLabel={closeLabel}>
       <Section>
@@ -111,9 +158,7 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
             <Text font={13} foregroundStyle={expired ? C.orange : authed ? C.accent : C.tertiary}>
               {expired ? "登录已失效，需要重新授权"
                 : !authed ? "未授权"
-                    // 小米没绑手机号时接口一定查不到东西：提前说清楚，不用等点同步才报错
-                    : id === "mi" && miPhones().length === 0 ? "已授权 · 未绑定取件手机号"
-                      : "已授权"}
+                  : "已授权"}
             </Text>
           </VStack>
           {authed ? (
@@ -130,9 +175,22 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
         </HStack>
       </Section>
 
-      {/* ---- 各平台的专属设置 ---- */}
+      {/* 得物要开订单页 + 钩 XHR + 固定等 7 秒，整步约 9 秒；实测组件扩展里能跑完，
+          但预算不够时会跳过，所以写“可能延后”而不是“儿不刷新” */}
+      {id === "dewu" ? (
+        <Section title="同步方式"
+          footer="得物要开订单页取数，较慢；App 每次同步都会跑，小组件预算够时会跑、不够就下次再补。">
+          <Text font={14} foregroundStyle={C.tertiary} frame={{ maxWidth: "infinity", alignment: "leading" }}>
+            App 与小组件都会同步（组件可能延后）
+          </Text>
+        </Section>
+      ) : null}
+
       {id === "pdd" ? (
-        <PddMobileSection authed={authed} bump={bump} />
+        <>
+          <PddAuthSection mode={authMode} onSwitch={(m) => void switchPddMode(m)} />
+          <PddMobileSection authed={authed} bump={bump} />
+        </>
       ) : null}
 
       {id === "taobao" || id === "cainiao" ? (
@@ -158,12 +216,8 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
         </Section>
       ) : null}
 
-      {id === "mi" ? (
-        <MiPhoneSection authed={authed} bump={bump} />
-      ) : null}
-
       <Section title="同步"
-        footer={hint ? `${hint.kind === "error" ? "最近一次失败" : "最近一次跳过"}：${hint.msg}` : undefined}>
+        footer={err && Date.now() - err.at < 3 * 3_600_000 ? `最近一次失败：${err.msg}` : undefined}>
         <HStack spacing={12} padding={{ vertical: 6 }} frame={{ maxWidth: "infinity", alignment: "leading" }}>
           <Icon name="clock.arrow.circlepath" size={18} color={C.accent} />
           <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" }}>
@@ -182,6 +236,9 @@ export function PlatformDetailPage({ id, close, bump, open, closeLabel }: {
     </SubPage>
   )
 }
+
+/** 丰巢 / 唯品会 / 得物 / 拼多多 / 淘宝 / 京东：登录页都是三级页，必须真 push */
+
 
 function sec(ms: number): string {
   return `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(1)}秒`

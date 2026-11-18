@@ -6,6 +6,7 @@ import { canBoundPageLoad, evaluateBounded, isPageCapability, isPageTimeout, loa
 import { attachNavWatch, formatObservedTimeout, redactLocation } from "./navWatch"
 import { SyncSuperseded, bindRunCleanup, isSupersededError, runIsCurrent } from "./syncGate"
 import { classifySalvage, formatDiscoveryFailure, type StageHit } from "./taobaoDiscover"
+import { LOGIN_INSET_FIX } from "./loginFix"
 
 /** 运行时全局 fetch（类型声明里没导出，跟 Response 情况一样） */
 declare const fetch: any
@@ -44,8 +45,10 @@ export function cookieHeader(): string {
 export async function loginTaobao(): Promise<boolean> {
   const controller = new WebViewController()
   try {
-    await controller.loadURL("https://login.taobao.com/member/login.jhtml")
-    await controller.present({ fullscreen: true, navigationTitle: "登录淘宝（登录后点完成）" })
+    try { await controller.addUserScript({ source: LOGIN_INSET_FIX, injectionTime: "documentStart" }) } catch { }
+    const presented = controller.present({ fullscreen: true, navigationTitle: "登录淘宝（登录后点完成）" })
+    try { await controller.loadURL("https://login.taobao.com/member/login.jhtml") } catch { }
+    await presented
     const cookies = await controller.getAllCookies()
     const usable = (cookies || []).filter((c: any) => /taobao|tmall|alibaba/.test(String(c.domain || "")))
     const logged = (cookies || []).some((c: any) => ["unb", "tracknick"].includes(String(c.name)) && !!c.value)
@@ -116,7 +119,8 @@ export function parseLogistics(html: string): {
   receiverName: string
   receiverPhone: string
 } {
-  const mailNo = firstMatch(html, /"mailNo":"(\d{6,})"/)
+  const mailNo = firstMatch(html, /"mailNo":"([A-Za-z0-9-]{8,})"/)
+    || firstMatch(html, /"consignMailNo":"([A-Za-z0-9-]{8,})"/)
   const company = firstMatch(html, /"logisticCompany":\{[^}]*?"name":"([^"]+)"/)
   // 官方状态：logisticsPackageStatus.statusCode，SIGN = 已签收（权威于节点文案）
   const statusCode = firstMatch(html, /"logisticsPackageStatus":\{"statusCode":"([A-Za-z_]+)"/)
@@ -460,7 +464,15 @@ export async function taobaoHumanVerify(deadline?: number, syncId: string | null
       })()`, 4_000, "读取验证页", ctx) || "{}")
       let info: any = {}
       try { info = JSON.parse(raw) } catch { }
-      if (info.has && !info.bad) { ok = true; break }
+      if (info.has && !info.bad) {
+        ok = true
+        try {
+          const list = await (controller as any).getAllCookies?.().catch(() => [])
+          const tb = (list || []).filter((k: any) => k.name && k.value && /(^|\.)taobao\.com$|(^|\.)tmall\.com$/.test(String(k.domain || "")))
+          if (tb.length) Keychain.set(COOKIE_KEY, JSON.stringify(tb))
+        } catch { }
+        break
+      }
     }
     if (presented) { try { await controller.dismiss() } catch { } }
     void p

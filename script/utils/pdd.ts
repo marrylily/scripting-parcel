@@ -1,6 +1,7 @@
-import { classify, closedOrderStatus, Pkg, statusFromCode, timeOfTrack } from "./model"
+import { classify, classifyAny, closedOrderStatus, Pkg, statusFromCode, timeOfTrack } from "./model"
 import { etaInObject, etaInText, etaTimeInText } from "./eta"
-import { safeDelay, safeTimeoutRace } from "./safeTimer"
+import { diag } from "./net"
+import { takeover } from "./webverify"
 
 export const PDD_COOKIE_KEY = "pdd.cookies"
 const PDD_LS_KEY = "pdd.localStorage"
@@ -18,7 +19,7 @@ const LOGIN_URL = "https://mobile.yangkeduo.com/login.html"
 const ORDERS_URL = "https://mobile.yangkeduo.com/orders.html"
 
 declare const fetch: any
-const delay = (ms: number) => safeDelay(ms)
+const delay = (ms: number) => new Promise<void>(resolve => (setTimeout as any)(resolve, ms))
 
 /* ---------------- 登录态 ---------------- */
 
@@ -450,7 +451,7 @@ async function fetchRaw(url: string): Promise<string> {
 
 /** 给可能卡住的 WebView 调用加超时：物流页地图瓦片会持续请求，waitForLoad 可能永远等不到 */
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return safeTimeoutRace(p, ms, "页面超时").catch(() => fallback)
+  return Promise.race([p, delay(ms).then(() => fallback) as unknown as Promise<T>])
 }
 
 /** 打开页面并同时拿回：渲染后文本 / 所有 order_sn 链接 / rawData */
@@ -567,6 +568,7 @@ export function parseOrderListResponse(json: string): { orders: PddOrder[]; expr
       statusHint: text(o.order_status_prompt) || text(o.order_status_desc) || text(o.orderStatusPrompt),
       trackingNumber: text(o.tracking_number) || text(o.trackingNumber),
       shippingId: text(o.shipping_id) || text(o.shippingId),
+      orderTime: orderTimeOf(o, sn),
     })
   }
   let expressTabs: PddExpressTabs | undefined
@@ -586,16 +588,106 @@ export function parseOrderListResponse(json: string): { orders: PddOrder[]; expr
   return { orders: out, expressTabs }
 }
 
+/** 订单时间：官方给秒级/毫秒级都有，没给就从单号日期前缀推（和页面路径同一套判定） */
+function orderTimeOf(o: any, sn: string): number | undefined {
+  const raw = Number(o?.order_time ?? o?.orderTime ?? o?.create_time ?? o?.createTime ?? 0)
+  if (raw > 0) return raw > 1e12 ? raw : raw * 1000
+  return snDateMs(sn)
+}
+
 /**
- * 读拼多多订单。
+ * 直连订单列表：官方 H5 自己的那个请求，只是不用开页面。
  *
+ * 路径必须带两层 `api/`（`/proxy/api` + 接口常量自带的 `api/`），少了就返 40003，
+ * 伪装成「请求参数错误」（实测：无凭证时返 40001，说明路径与 body 都对，只缺登录态）。
+ * H5 请求不带 anti_content（只有原生容器才带），所以这里也不带。
+ */
+export async function pddOrderListDirect(
+  type: string,
+  page = 1,
+): Promise<{ orders: PddOrder[]; expressTabs?: PddExpressTabs }> {
+  const cookies = pddCookies()
+  const cookie = cookies.map((c: any) => `${c.name}=${c.value}`).join("; ")
+  const token = String(cookies.find((c: any) => String(c?.name) === "PDDAccessToken")?.value ?? "")
+  const uid = String(cookies.find((c: any) => /^pdd_(user_?id|uid)$/i.test(String(c?.name ?? "")))?.value ?? "")
+  const url = `https://mobile.yangkeduo.com/proxy/api/api/aristotle/order_list_v4${uid ? `?pdduid=${encodeURIComponent(uid)}` : ""}`
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json;charset=UTF-8",
+      Cookie: cookie,
+      "User-Agent": SAFARI_UA,
+      Referer: ORDERS_URL,
+      Origin: "https://mobile.yangkeduo.com",
+      ...(token ? { AccessToken: token } : {}),
+    },
+    body: JSON.stringify({
+      type,
+      key_word: "",
+      size: 50,
+      page,
+      pay_channel_list: [],
+      userAgent: SAFARI_UA,
+      origin_host_name: "mobile.yangkeduo.com",
+      scene: "order_list_h5",
+    }),
+  })
+  const body = await res.text()
+  let j: any = null
+  try { j = JSON.parse(body) } catch { throw new Error("拼多多订单接口返回的不是 JSON") }
+  const code = j?.error_code == null ? "" : String(j.error_code)
+  if (code === "40001") throw new Error("拼多多登录态无效，请重新登录")
+  if (code === "40002") throw new Error("拼多多网络繁忙，稍后再试")
+  if (code && code !== "0" && code !== "1000000") throw new Error(String(j?.error_msg || j?.error_message || `订单接口失败（${code}）`))
+  return parseOrderListResponse(body)
+}
+
+/** 直连版发现：先问「待收货」，没单再问「全部」。任一步报错就交给页面版 */
+async function pddDiscoverByApi(): Promise<PddDiscoverResult> {
+  const pending = await pddOrderListDirect("unreceived")
+  if (pending.orders.length > 0) {
+    return {
+      orders: pending.orders, html: "", text: "", logged: true, blocked: false,
+      pendingTab: "pending", scope: "pending", expressTabs: pending.expressTabs,
+    }
+  }
+  // 「全部」在不同版本里叫 all 或 refresh：一个报参数错误就换另一个试
+  let all: { orders: PddOrder[]; expressTabs?: PddExpressTabs }
+  try {
+    all = await pddOrderListDirect("all")
+  } catch {
+    all = await pddOrderListDirect("refresh")
+  }
+  return {
+    orders: all.orders, html: "", text: "", logged: true, blocked: false,
+    pendingTab: "empty", scope: "all",
+    expressTabs: all.expressTabs ?? pending.expressTabs,
+  }
+}
+
+/**
+ * 读拼多多订单：先直连，出错再开页面。
+ * 直连能拿到的和页面点 tab 一样（待收货 / 全部两种筛选），但不用开 WebView、不怕页面改版；
+ * 只有在登录态过期、风控、接口对不上时才回落页面（页面能顺带把会话刷回来）。
+ */
+export async function pddDiscoverOrders(): Promise<PddDiscoverResult> {
+  try {
+    return await pddDiscoverByApi()
+  } catch (e: any) {
+    diag("pdd-order-api", { err: String(e?.message ?? e) })
+    return pddDiscoverOrdersByPage()
+  }
+}
+
+/**
+ * 读拼多多订单（页面版，兜底）。
  * 主线路：用平台自己的筛选接口。拼多多订单页点 tab 时会发 `POST /proxy/api/api/aristotle/order_list_v4`，
  * body 里的 type 就是筛选条件（all / unshipping 待发货 / unreceived 待收货）。请求带 anti_content 风控签名，
  * 我们不去算，而是在 documentStart 钩住 XHR 把页面自己请求回来的响应收下来。
  *   1) 先点「待收货」——有单就用它（真正的平台筛选）；
  *   2) 没单或接口没拿到 → 兜底「全部」（rawData 预渲染全量，含历史单），跟淘宝/京东一致。
  */
-export async function pddDiscoverOrders(): Promise<PddDiscoverResult> {
+export async function pddDiscoverOrdersByPage(): Promise<PddDiscoverResult> {
   const c = new WebViewController()
   try {
     await prepare(c)
@@ -773,9 +865,14 @@ export async function pddFetchPackage(order: { orderSn: string; itemTitle: strin
   const page = await openPage(url)
   const info = page.raw ? extractLogistics(page.raw) : extractLogistics({})
   const textInfo = parseLogisticsText(page.text)
-  // 官方状态码优先（statusFromCode），没有就退回关键词
-  const latest = info.statusDesc || textInfo.latest || info.latest || order.statusHint || ""
-  const status = statusFromCode(info.statusCode) ?? classify(latest)
+  // 官方状态码优先（statusFromCode），没有就退回关键词；
+  // 多个文案一起看：官方状态描述、节点、订单列表状态词——签收/退款这类强信号不能被旧节点盖掉。
+  let latest = info.statusDesc || textInfo.latest || info.latest || order.statusHint || ""
+  const status = statusFromCode(info.statusCode)
+    ?? closedOrderStatus(`${info.statusDesc} ${order.statusHint}`)
+    ?? classifyAny(info.statusDesc, latest, order.statusHint)
+  // 官方说签收就直接用官方文案（节点可能停在「已存放至驿站」）
+  if (status === "delivered" && info.statusDesc) latest = info.statusDesc
   const etaSrc = [info.eta, latest, textInfo.latest].filter(Boolean).join(" ")
   return {
     orderId: `pdd:${order.orderSn}`,
@@ -798,6 +895,52 @@ export async function pddFetchPackage(order: { orderSn: string; itemTitle: strin
     etaAt: etaTimeInText(etaSrc)?.at,
     updatedAt: Date.now(),
   }
+}
+
+/**
+ * 单条订单查物流：先走直连（官方驿站物流接口，按 order_sn），拿不到轨迹节点再开物流页。
+ *
+ * 直连的好处是每单不用开一个 WebView（京东/拼多多每单一个页面既慢又容易被风控），
+ * 代价是拿不到物流页上的收货地址/驿站名——那些只在回落路径里才有。
+ */
+export async function pddFetchPackageFast(order: {
+  orderSn: string; itemTitle: string; shopName: string; statusHint: string;
+  trackingNumber?: string; shippingId?: string
+}): Promise<Pkg> {
+  if (!order.orderSn) return pddFetchPackage(order)
+  try {
+    const { pddTrack } = await import("./pddExpress")
+    const t = await pddTrack(order.trackingNumber || "", { orderSn: order.orderSn })
+    if (t.nodes.length > 0) {
+      const nodes = [...t.nodes]
+        .map(n => ({ n, at: timeOfTrack(n.time) }))
+        .sort((a, b) => b.at - a.at)
+        .map(x => x.n)
+        .slice(0, 60)
+      const latest = t.latest || nodes[0]?.text || order.statusHint || ""
+      const status = statusFromCode(t.statusCode)
+        ?? closedOrderStatus(`${t.latest} ${order.statusHint}`)
+        ?? classifyAny(t.latest, latest, order.statusHint)
+      const etaSrc = [t.forecast, latest].filter(Boolean).join(" ")
+      return {
+        orderId: `pdd:${order.orderSn}`,
+        source: "pdd",
+        itemTitle: order.itemTitle,
+        shopName: order.shopName,
+        company: t.company,
+        mailNo: t.mailNo || order.trackingNumber || "",
+        latest,
+        status,
+        tracks: nodes,
+        eta: etaInText(etaSrc),
+        etaAt: etaTimeInText(etaSrc)?.at,
+        updatedAt: Date.now(),
+      }
+    }
+  } catch (e: any) {
+    diag("pdd-track-api", { sn: order.orderSn, err: String(e?.message ?? e) })
+  }
+  return pddFetchPackage(order)
 }
 
 export async function pddSyncAll(
@@ -827,9 +970,11 @@ export async function pddSyncAll(
     picked = [...picked].sort((a, b) => (b.orderTime ?? 0) - (a.orderTime ?? 0)).slice(0, MAX_ORDERS)
   }
   const out: Pkg[] = []
-  // 已完成 / 已关闭的订单：订单状态本身就说完了，**不再开物流页**（否则几十个历史单每单一个网页），
+  // 已完成 / 已签收 / 已关闭的订单：订单状态本身就说完了，**不再开物流页**（否则几十个历史单每单一个网页），
   // 只产出一条精简记录，让 upsert 能更新已有条目（mailNo 为空 → 新单不入库）。
-  const isDone = (h: string) => /已完成|交易完成|已关闭|交易关闭|已取消|退款成功|已退款/.test(h || "")
+  // 注意：以前漏了「已签收」——拼多多的签收单状态词就是这三字，
+  // 结果历史签收单被当成活单开了物流页，拿回来的旧节点又停在「已存放至驿站」，就被当成在途导入了。
+  const isDone = (h: string) => /已完成|交易完成|已签收|已送达|已关闭|交易关闭|已取消|退款成功|已退款/.test(h || "")
   const doneOrders = picked.filter(o => isDone(o.statusHint))
   const liveOrders = picked.filter(o => !isDone(o.statusHint))
   for (const o of doneOrders) {
@@ -858,7 +1003,7 @@ export async function pddSyncAll(
   }
   for (let i = 0; i < livePicked.length; i++) {
     if (Date.now() > deadline) break
-    try { out.push(await pddFetchPackage(livePicked[i])) } catch { }
+    try { out.push(await pddFetchPackageFast(livePicked[i])) } catch { }
     onProgress?.(i + 1, livePicked.length)
     if (i < livePicked.length - 1) await delay(600)
   }
@@ -867,32 +1012,17 @@ export async function pddSyncAll(
 
 
 export async function pddHumanVerify(): Promise<boolean> {
-  const controller = new WebViewController()
-  try {
-    await prepare(controller)
-    await controller.loadURL(ORDERS_URL)
-    await controller.waitForLoad()
-    let presented = true
-    const pr = controller.present({ fullscreen: true, navigationTitle: "拼多多需要验证" })
-      .then(() => { presented = false }).catch(() => { presented = false })
-    const deadline = Date.now() + 3 * 60_000
-    let ok = false
-    while (presented && Date.now() < deadline) {
-      await delay(1200)
-      if (!presented) break
-      // 过了 = 订单列表出现 order_sn 链接（验证页没有）
-      const html = String(await controller.evaluateJavaScript<string>("return document.documentElement ? document.documentElement.outerHTML.slice(0, 500000) : ''") || "")
-      if (/order_sn=\d{8,}/.test(html)) { ok = true; break }
-    }
-    if (presented) { try { await controller.dismiss() } catch { } }
-    try { await pr } catch { }
-    await delay(400)
-    if (ok) {
-      // 会话已更新，顺手存回钥匙串
-      try { await saveSession(controller) } catch { }
-    }
-    return ok
-  } finally {
-    controller.dispose()
-  }
+  const r = await takeover({
+    key: "pdd",
+    title: "拼多多需要验证",
+    url: ORDERS_URL,
+    // 拼多多的会话不只在 Cookie 里，UA 和 localStorage 也得带上
+    seed: (c) => prepare(c),
+    // 过了 = 订单列表出现 order_sn 链接（验证页没有）
+    done: async (c) => /order_sn=\d{8,}/.test(String(await c.evaluateJavaScript<string>(
+      "return document.documentElement ? document.documentElement.outerHTML.slice(0, 500000) : ''") || "")),
+    collect: async (c) => { await saveSession(c) },
+  }, { auto: true })
+  if (!r.ok) diag("pdd-verify", r)
+  return r.ok
 }

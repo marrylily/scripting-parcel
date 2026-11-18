@@ -1,5 +1,5 @@
 // 包裹页 —— 原「所有取件码」搬入 tab：搜索 + 全部/待取/已取筛选 + 列表；右上/悬浮 + 新增包裹。
-import { Button, Capsule, HStack, Picker, ScrollView, Text, TextField, VStack, ZStack, useState } from "scripting"
+import { Button, Capsule, Device, HStack, Picker, ScrollView, Text, TextField, VStack, ZStack, useState } from "scripting"
 import { C, CAPSULE, alpha } from "../theme"
 import { FloatingActions, Icon, BigTitle, Screen } from "./kit"
 import { PickupRow } from "./PickupRow"
@@ -8,13 +8,12 @@ import { companyName } from "../theme"
 import { isAwaitingPickup, isTransitPkg, sourceOf, stationHaystack, cardTitleOf } from "../utils/model"
 import { brandOf } from "../utils/appBrand"
 
-export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged, onRefresh }: {
+export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged }: {
   revision: number
   onAdd: () => void
   onEdit: (p: Pickup) => void
   onExit: () => void
   onChanged: () => void
-  onRefresh?: () => Promise<void>
 }) {
   void revision
   // 筛选记忆：跨启动保存在 Storage
@@ -98,7 +97,6 @@ export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged, onRefre
       <ScrollView navigationTitle="" navigationBarTitleDisplayMode="inline" scrollIndicator="never"
         toolbarVisibility={{ visibility: "hidden", bars: ["navigationBar"] }}
         scrollDismissesKeyboard="interactively"
-        refreshable={onRefresh}
         onScrollPhaseChange={(_old, phase, context) => {
           // 只在顶部继续下拉、且松手后展开；普通纵向滚动和卡片横滑不拦截。
           if (phase !== "tracking" && phase !== "interacting") {
@@ -115,7 +113,7 @@ export function ParcelsTab({ revision, onAdd, onEdit, onExit, onChanged, onRefre
         {filterBar}
         <VStack spacing={8} frame={{ maxWidth: "infinity", alignment: "leading" }} padding={{ top: 16, bottom: 170 }}>
           {list.length === 0 ? (
-            <VStack spacing={10} frame={{ maxWidth: "infinity" }} padding={{ vertical: 60 }}>
+            <VStack spacing={10} frame={{ maxWidth: "infinity", minHeight: Math.max(260, Device.screen.height - 430) }}>
               <Icon name="shippingbox" size={44} color={C.tertiary} />
               <Text font={17} foregroundStyle={C.secondary}>{q ? "没有匹配的包裹" : "暂无包裹"}</Text>
               {!q ? <Text font={13} foregroundStyle={C.tertiary} multilineTextAlignment="center">授权电商平台后会自动同步，也可以搜索运单号添加</Text> : null}
