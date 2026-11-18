@@ -4,19 +4,14 @@ import { runWidgetTasks, tickLive } from "./utils/widgetTasks"
 import { isAwaitingPickup, isTransitPkg } from "./utils/model"
 import { WidgetBody, TXT_C, SUB_C } from "./ui/widgetLayout"
 import type { CardSize } from "./ui/parcelCard"
-import { jdHasLogin } from "./utils/jd"
-import { hasLogin } from "./utils/net"
-import { pddHasLogin } from "./utils/pdd"
 import { operationFiles, readJsonFile } from "./utils/sharedJson"
 
-// 模块加载完成即落一条引导日志；没有 perf 新行时用它区分“没唤醒”和“初始化失败”。
 try {
   const dir = `${FileManager.appGroupDocumentsDirectory}/cc`
   if (!FileManager.existsSync(dir)) FileManager.createDirectorySync(dir, true)
   FileManager.writeAsStringSync(`${dir}/widgetBoot.txt`, `${Date.now()}|${WIDGET_VERSION}`)
 } catch { }
 
-/** 组件下一次重建的间隔：直接用设置里的「重建」值（与设置页同一个下限 5 分钟） */
 function widgetReloadMs(snap?: any): number {
   try {
     const s: any = (snap && snap.settings) || Storage.get<any>("cc.settings") || {}
@@ -25,13 +20,11 @@ function widgetReloadMs(snap?: any): number {
   } catch { return 10 * 60_000 }
 }
 
-/** 把共享目录里的 trackUpdates / newPackages / picked 叠加进内存 snap，确保桌面永远渲染最新状态 */
 function mergeSharedOverlays(snap: any): void {
   if (!snap || typeof snap !== "object") return
   const ccDir = `${FileManager.appGroupDocumentsDirectory}/cc`
   if (!Array.isArray(snap.pickups)) snap.pickups = []
 
-  // 1. 合并后台发现的新包裹 (newPackages.json)
   try {
     const npFile = `${ccDir}/newPackages.json`
     if (FileManager.existsSync(npFile)) {
@@ -46,7 +39,6 @@ function mergeSharedOverlays(snap: any): void {
     }
   } catch { }
 
-  // 2. 合并后台刷到的最新物流轨迹 (trackUpdates.json)
   try {
     const tuFile = `${ccDir}/trackUpdates.json`
     if (FileManager.existsSync(tuFile)) {
@@ -55,7 +47,6 @@ function mergeSharedOverlays(snap: any): void {
         snap.pickups = snap.pickups.map((p: any) => {
           const u = p?.uuid ? updates[String(p.uuid)] : undefined
           if (!u) return p
-          // 仅当增量更新比快照里的新时才覆盖
           if ((u.trackUpdatedAt ?? u.at ?? 0) >= (p.trackUpdatedAt ?? 0)) {
             return { ...p, ...u }
           }
@@ -65,7 +56,6 @@ function mergeSharedOverlays(snap: any): void {
     }
   } catch { }
 
-  // 3. 合并已取件状态 (picked.json & ops/picked)
   try {
     const pf = `${ccDir}/picked.json`
     if (FileManager.existsSync(pf)) {
@@ -81,7 +71,7 @@ function mergeSharedOverlays(snap: any): void {
   try {
     const dir = `${ccDir}/ops/picked`
     for (const file of operationFiles(dir)) {
-      const op = readJsonFile<{ uuid?: string }>(file, {})
+      const op = readJsonFile<any>(file, {})
       if (!op.uuid) continue
       snap.pickups = snap.pickups.map((p: any) => p?.uuid === op.uuid ? { ...p, status: 2, pickedByUser: true } : p)
     }
@@ -124,16 +114,13 @@ async function run() {
       snap = JSON.parse(FileManager.readAsStringSync(snapFile) || "{}")
     }
   } catch { }
-  if (!Array.isArray(snap.pickups)) { try { snap.pickups = Storage.get<any[]>("cc.pickups") ?? [] } catch { } }
+  if (!Array.isArray(snap.pickups)) { try { snap.pickups = Storage.get<any>("cc.pickups") ?? [] } catch { } }
   if (!snap.settings || typeof snap.settings !== "object") { try { snap.settings = Storage.get<any>("cc.settings") ?? {} } catch { } }
 
-  // 先叠一次增量与已取状态
   mergeSharedOverlays(snap)
 
-  // quietUntil：刚刚在组件上点过圈，本地已改数据，这次重建只出图，不跑联网。
   const quiet = Number((snap as any).quietUntil || 0) > Date.now()
 
-  // 新构建后的「第一帧」不联网，先把图打出来防灰屏；后续每次后台唤醒先联网刷新再 present！
   let firstOfBuild = false
   try {
     const vf = `${ccDir}/widgetBuiltVersion.txt`
@@ -142,13 +129,10 @@ async function run() {
     if (firstOfBuild) FileManager.writeAsStringSync(vf, WIDGET_VERSION)
   } catch { }
 
-  // 核心修复：必须在 Widget.present 之前执行 await backgroundSync(snap)！
-  // 这样刷出来的最新物流才能直接渲染到本次组件视图上，且不会被系统提前挂起回收。
   if (!quiet && !firstOfBuild) {
     const tSync = Date.now()
     try {
       await backgroundSync(snap)
-      // 同步完成后重新从磁盘读取最新快照并叠加增量，确保内存 snap 100% 是最新数据
       if (FileManager.existsSync(snapFile)) {
         const freshSnap = JSON.parse(FileManager.readAsStringSync(snapFile) || "{}")
         if (Array.isArray(freshSnap.pickups) && freshSnap.pickups.length > 0) {
@@ -191,7 +175,6 @@ async function run() {
   try { Script.exit() } catch { }
 }
 
-/** 出图前的联网任务：一个时间片只做一件联网的事（优先已有单物流刷新，其次全量轮转），外加灵动岛到期检查 */
 async function backgroundSync(snap: any) {
   const s: any = (snap && snap.settings) || {}
   if (s.bgRefresh === false) { try { tickLive() } catch { } return }
@@ -199,7 +182,6 @@ async function backgroundSync(snap: any) {
     rebuildMin: Number(s.refreshWidgetMin ?? 5),
     lightMin: Number(s.refreshExistingMin ?? 10),
     fullMin: Number(s.fullRotateMin ?? 15),
-    // 给足 6.5 秒预算（原 3 秒太短极易超时中断，6.5 秒足够跑完轻量刷新且远低于 iOS 15 秒强杀线）
     budgetMs: 6500,
   })
 }
