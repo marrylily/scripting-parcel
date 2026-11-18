@@ -38,11 +38,12 @@ function enrichTrackUpdate(u: any, latestText: string, nodes?: any[], pkg?: any)
   return u
 }
 
-/** 快递鸟纯 HTTP 极速线路：无需 WebView，适合小组件后台高频刷新 */
+/** 快递鸟纯 HTTP 极速线路：无需 WebView，自带手机号尾号透传，适合小组件后台高频刷新 */
 async function refreshViaKdniao(no: string, shipperCode?: string, pkg?: any): Promise<any> {
   if (!no || no.length < 5) return null
   try {
-    const r = await queryTracking(no, { shipperCode })
+    const phone = String(pkg?.phone || pkg?.mobile || pkg?.receiverPhone || pkg?.tail || "").trim()
+    const r = await queryTracking(no, { shipperCode, phone })
     if (!r) return null
     const latest = String(r.latest || "").replace(/\s+/g, " ").trim()
     const hasNodes = Array.isArray(r.nodes) && r.nodes.length > 0
@@ -122,8 +123,7 @@ export async function refreshMailNos(
       const mailNo = String(it.no || pkg.mailNo || "").trim()
       const shipperCode = it.shipperCode || pkg.shipperCode || ""
 
-      // 核心优化：在小组件后台，只要有运单号 mailNo，100% 优先走快递鸟纯 HTTP 极速接口！
-      // 彻底避开淘宝/京东/拼多多在小组件无 WebView 环境下的卡死和失败。
+      // 在小组件后台，只要有运单号 mailNo，100% 优先走快递鸟纯 HTTP 极速接口
       if (mailNo && mailNo.length >= 5) {
         u = await refreshViaKdniao(mailNo, shipperCode, pkg)
       }
